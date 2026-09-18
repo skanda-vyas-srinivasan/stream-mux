@@ -21,9 +21,9 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSScreenCaptureUsageDescription</key>
-	<string>multipoint captures screen audio so it can be routed to another device.</string>
+	<string>SoundMux captures screen audio so it can be routed to another device.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>multipoint sends captured audio to your selected Mac on the local network.</string>
+	<string>SoundMux sends captured audio to your selected Mac on the local network.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

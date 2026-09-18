@@ -1,33 +1,46 @@
-# soundmux
+# SoundMux
 
-`soundmux` is a peer-to-peer, low-latency audio-routing project. The first
-milestone is intentionally limited to capturing iPhone system audio with
-ScreenCaptureKit on iOS 27. Networking and macOS playback begin only after the
-capture probe works on a physical iPhone.
-
-## Current phase
-
-The iOS app presents Apple's system content-sharing picker, starts a
-full-display capture after explicit approval, receives system-audio sample
-buffers, logs their format and timing, updates a live buffer counter, and
-discards screen frames.
-
-See [docs/phase-1-ios-capture.md](docs/phase-1-ios-capture.md) for requirements,
-build instructions, and the current toolchain blocker.
-
-## Layout
+SoundMux is a peer-to-peer audio-routing app that sends audio between devices
+over a local network and plays it through the receiver's selected speakers,
+headphones, or AirPods.
 
 ```text
-core/                 Portable C++20 components (future phases)
-  protocol/
-  network/
-  jitter/
-  clock/
-  audio/
-  util/
-ios/MultiAudioIOS/    iOS 27 ScreenCaptureKit capture probe
-macos/MultiAudioMac/  macOS receiver placeholder (future phase)
-tests/                Portable-core tests (future phase)
-docs/                 Design and validation notes
+iPhone ───────┐
+Windows PC ───┼──> SoundMux receiver ──> audio output
+Linux PC ─────┤
+Mac ──────────┘
 ```
 
+The finished app is designed to support automatic device discovery, multiple
+simultaneous senders, receiver-side mixing, output selection, live connection
+statistics, clock synchronization, and direct encrypted connections across
+iOS, macOS, Windows, Linux, and Android.
+
+## Current implementation
+
+The working path is iPhone to Mac. The iPhone uses the supported iOS 27
+ScreenCaptureKit sharing flow to capture system audio after explicit approval,
+converts it to 48 kHz stereo PCM, and sends it over UDP. The Mac reconstructs
+recoverable packet loss, buffers network jitter, and plays the stream through
+CoreAudio.
+
+The portable C++20 core provides packet serialization, UDP transport, a jitter
+buffer, an audio ring buffer, and 10-data + 5-parity erasure coding. Apple
+capture and playback integrations remain outside the portable core.
+
+## Build
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build -j 8
+ctest --test-dir build --output-on-failure
+
+./build/macos/MultiAudioMac/multipoint_receiver 48100 100
+```
+
+Build the iPhone sender from
+`ios/MultiAudioIOS/MultiAudioIOS.xcodeproj` using Xcode 27 and a physical iPhone
+running iOS 27 or later.
+
+Detailed implementation and test notes are in
+[docs/project-context.md](docs/project-context.md).

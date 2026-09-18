@@ -58,7 +58,7 @@ xcodebuild \
 1. Tap **Start Capture**.
 2. Approve full-display capture in Apple's system picker.
 3. Start audio in another app.
-4. Return to MultiAudio if desired. The capture should survive backgrounding
+4. Return to SoundMux if desired. The capture should survive backgrounding
    because the target declares the `screen-capture` background mode.
 5. Confirm the audio-buffer count and latest format/timing values update.
    With no audio playing, RMS and peak should read `−∞ dBFS` or a very low

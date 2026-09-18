@@ -1,10 +1,10 @@
-# Multipoint Project Context
+# SoundMux Project Context
 
 This document is the handoff point for the next session.
 
 ## Project goal
 
-Multipoint is intended to become a cross-platform, peer-to-peer multi-device audio-routing system. The first and only active milestone is:
+SoundMux is a cross-platform, peer-to-peer multi-device audio-routing system. The first implemented platform path is:
 
 ```text
 iPhone ScreenCaptureKit audio -> PCM packets -> UDP/LAN -> Mac jitter buffer
@@ -140,7 +140,9 @@ The current uncompressed format is about 3.2 Mbps and roughly 400 UDP packets/se
 - Wi-Fi signal was strong, but ping also showed intermittent loss. The user cannot test another Wi-Fi network right now.
 - PCM16 reduced bandwidth from the earlier float32 wire format. A 100 ms receiver buffer, improved gap handling, and history-based concealment reduced but did not eliminate artifacts.
 - Pairwise XOR FEC was physically tested and was insufficient: in one run 17 packets were declared lost and only 6 were recovered. The user still heard bad artifacts.
-- Source now replaces pairwise XOR with a systematic GF(256) 10+5 erasure code capable of recovering any five missing packets in a group. It compiles in both CMake and Xcode and passes local tests, but this newest build has **not** yet been installed or heard on the physical devices.
+- Pairwise XOR was replaced with a systematic GF(256) 10+5 erasure code capable of recovering any five missing packets in a group. It compiles in CMake and Xcode, passes byte-exact recovery tests, and has now been validated on the physical iPhone/Mac path.
+- In the first physical GF(256) run, the user reported a stark improvement and heard few gaps. The sender sustained roughly 300 total audio/parity datagrams per second with zero queue drops or send failures, the Mac reported zero CoreAudio underruns, and the recovery counter increased during observed network loss.
+- Some bursts still exceeded or escaped the current recovery window, so the audio path is substantially improved but not yet artifact-free.
 - The previously installed delayed-XOR build proved that callback-triggered sending continues off-app. Do not restore independent high-frequency sender timers; iOS throttled them in the background and the queue overflowed.
 
 ## Important current limitations
@@ -155,13 +157,12 @@ The current uncompressed format is about 3.2 Mbps and roughly 400 UDP packets/se
 
 ## Next session: recommended order
 
-1. Install the newest iOS build containing GF(256) 10+5 FEC; the current source is built but not installed.
-2. Restart the freshly built Mac receiver with `48100 100` and launch the iPhone app with USB metrics.
-3. Verify foreground playback, then switch to the media app and confirm background capture/sending stays near 300 total datagrams/sec with zero queue drops.
-4. Listen for at least two minutes and compare `fec_recovered` against `lost`. Success means loss bursts are recovered before playout and `lost`/`concealed` remain near zero after startup.
-5. If more than five data shards per FEC group are missing, increase interleaving across groups or evaluate Opus; do not return to co-locating parity with its protected audio.
-6. Only after this path is stable: add drift estimation/adaptive resampling, then Bonjour discovery.
+1. Repeat a controlled multi-minute GF(256) run and separate startup/app-switch loss from steady-state loss in the statistics.
+2. Track loss by FEC group so diagnostics distinguish recovered source loss, unrecoverable groups, and lost parity.
+3. If more than five data shards per group are missing, increase interleaving across groups or evaluate Opus; do not return to co-locating parity with its protected audio.
+4. Add clock-drift estimation and gradual adaptive resampling after burst recovery is stable.
+5. Add Bonjour discovery after manual-IP streaming is consistently reliable.
 
 ## Current honest milestone
 
-The project has proven supported iOS 27 ScreenCaptureKit system-audio capture, background capture delivery, UDP transport, and CoreAudio playback on a physical iPhone/Mac pair. Background-safe sending is understood, but audible LAN loss remains. The next physical test is the newly implemented 10+5 erasure code. Do not call the MVP reliable until that test is clean.
+SoundMux has proven supported iOS 27 ScreenCaptureKit system-audio capture, background capture delivery, UDP transport, GF(256) burst-loss recovery, and CoreAudio playback on a physical iPhone/Mac pair. The newest recovery design produced a clear audible improvement, but occasional artifacts remain. Do not call the transport production-reliable until steady-state unrecoverable loss is understood and controlled.

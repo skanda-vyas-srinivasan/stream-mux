@@ -60,7 +60,7 @@ struct ContentView: View {
                     }
                 }
             }
-            .navigationTitle("multipoint")
+            .navigationTitle("SoundMux")
         }
     }
 }
