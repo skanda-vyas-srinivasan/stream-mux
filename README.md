@@ -1,4 +1,4 @@
-# multipoint
+# Linkverge
 
 `multipoint` is a peer-to-peer, low-latency audio-routing project. The first
 milestone is intentionally limited to capturing iPhone system audio with
