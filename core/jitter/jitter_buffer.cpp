@@ -50,7 +50,7 @@ bool JitterBuffer::insert(protocol::AudioPacket packet) {
     return true;
 }
 
-PopResult JitterBuffer::pop() {
+PopResult JitterBuffer::pop(bool declare_missing) {
     if (!started_) {
         if (!initialized_ || packets_.size() < target_packets_) {
             return {.status = PopStatus::not_ready, .packet = std::nullopt};
@@ -59,13 +59,18 @@ PopResult JitterBuffer::pop() {
         started_ = true;
     }
 
-    const auto sequence = next_sequence_++;
+    const auto sequence = next_sequence_;
     const auto found = packets_.find(sequence);
     if (found == packets_.end()) {
+        if (!declare_missing) {
+            return {.status = PopStatus::not_ready, .packet = std::nullopt};
+        }
+        ++next_sequence_;
         ++stats_.packets_lost;
         return {.status = PopStatus::missing, .packet = std::nullopt};
     }
 
+    ++next_sequence_;
     auto packet = std::move(found->second);
     packets_.erase(found);
     return {.status = PopStatus::packet, .packet = std::move(packet)};

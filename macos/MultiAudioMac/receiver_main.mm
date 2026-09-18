@@ -2,6 +2,7 @@
 #include "multipoint/jitter/jitter_buffer.h"
 #include "multipoint/network/udp_socket.h"
 #include "multipoint/protocol/audio_packet.h"
+#include "multipoint/protocol/fec.h"
 
 #include <AudioToolbox/AudioToolbox.h>
 
@@ -14,7 +15,9 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -35,6 +38,14 @@ struct AudioState {
         kMaxRenderFrames * multipoint::protocol::kChannelCount,
         0.0F);
     std::atomic<bool> playout_active{false};
+};
+
+struct FecGroup {
+    std::optional<multipoint::protocol::AudioPacketHeader> base_header;
+    std::array<std::optional<std::vector<std::byte>>,
+               multipoint::protocol::kFecDataShards> data;
+    std::array<std::optional<std::vector<std::byte>>,
+               multipoint::protocol::kFecParityShards> parity;
 };
 
 OSStatus render_audio(
@@ -141,17 +152,25 @@ int main(int argc, char** argv) {
             multipoint::protocol::kSampleRate;
         const auto target_packets = std::max<std::size_t>(
             1, static_cast<std::size_t>(target_latency_ms / packet_ms));
+        const auto reorder_packets = std::min<std::size_t>(
+            8, std::max<std::size_t>(1, target_packets / 4));
 
         multipoint::network::UdpReceiver receiver(port);
-        multipoint::jitter::JitterBuffer jitter(target_packets, 512);
+        multipoint::jitter::JitterBuffer jitter(reorder_packets, 512);
         AudioState audio;
         DefaultOutput output(audio);
         std::mutex jitter_mutex;
         std::atomic<bool> receive_running{true};
         std::atomic<std::uint64_t> malformed_packets{0};
+        std::atomic<std::uint64_t> fec_recovered{0};
+        std::atomic<std::uint64_t> max_arrival_gap_ns{0};
+        std::atomic<std::uint64_t> arrival_gap_events{0};
 
         std::thread receive_thread([&] {
             std::array<std::byte, 2'048> datagram{};
+            std::optional<std::chrono::steady_clock::time_point> last_arrival;
+            std::optional<std::uint64_t> current_stream;
+            std::map<std::uint32_t, FecGroup> fec_groups;
             while (receive_running.load(std::memory_order_relaxed)) {
                 try {
                     const auto size = receiver.receive(datagram);
@@ -162,8 +181,101 @@ int main(int argc, char** argv) {
                         malformed_packets.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
-                    std::lock_guard lock(jitter_mutex);
-                    jitter.insert(std::move(*decoded.packet));
+                    const auto arrival = std::chrono::steady_clock::now();
+                    if (last_arrival) {
+                        const auto gap = static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                arrival - *last_arrival).count());
+                        auto previous = max_arrival_gap_ns.load(std::memory_order_relaxed);
+                        while (gap > previous &&
+                               !max_arrival_gap_ns.compare_exchange_weak(
+                                   previous, gap, std::memory_order_relaxed)) {}
+                        if (gap >= 10'000'000) {
+                            arrival_gap_events.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    last_arrival = arrival;
+
+                    auto packet = std::move(*decoded.packet);
+                    if (!current_stream || *current_stream != packet.header.stream_id) {
+                        std::lock_guard lock(jitter_mutex);
+                        jitter.reset();
+                        fec_groups.clear();
+                        current_stream = packet.header.stream_id;
+                    }
+
+                    const bool is_audio = packet.header.packet_type ==
+                        multipoint::protocol::kAudioPacketType;
+                    const auto shard = packet.header.fec_shard_index;
+                    if ((is_audio && shard >= multipoint::protocol::kFecDataShards) ||
+                        (!is_audio &&
+                         (shard < multipoint::protocol::kFecDataShards ||
+                          shard >= multipoint::protocol::kFecDataShards +
+                              multipoint::protocol::kFecParityShards))) {
+                        malformed_packets.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+
+                    const auto group_base = is_audio
+                        ? packet.header.sequence - shard
+                        : packet.header.sequence;
+                    auto& group = fec_groups[group_base];
+                    if (!group.base_header) {
+                        auto header = packet.header;
+                        header.packet_type = multipoint::protocol::kAudioPacketType;
+                        header.sequence = group_base;
+                        if (is_audio) {
+                            header.sample_index -= static_cast<std::uint64_t>(shard) *
+                                multipoint::protocol::kFramesPerPacket;
+                        }
+                        header.fec_shard_index = 0;
+                        group.base_header = header;
+                    }
+
+                    if (is_audio) {
+                        if (!group.data[shard]) {
+                            group.data[shard] = packet.encoded_payload;
+                        }
+                        std::lock_guard lock(jitter_mutex);
+                        jitter.insert(std::move(packet));
+                    } else {
+                        const auto parity_index = static_cast<std::size_t>(
+                            shard - multipoint::protocol::kFecDataShards);
+                        if (!group.parity[parity_index]) {
+                            group.parity[parity_index] = std::move(packet.encoded_payload);
+                        }
+                    }
+
+                    const auto recovered_shards =
+                        multipoint::protocol::recover_fec_data(
+                            group.data, group.parity);
+                    if (recovered_shards) {
+                      for (auto recovered_shard : *recovered_shards) {
+                        const auto missing_index = recovered_shard.data_index;
+                        auto recovered_header = *group.base_header;
+                        recovered_header.sequence = group_base +
+                            static_cast<std::uint32_t>(missing_index);
+                        recovered_header.sample_index += missing_index *
+                            multipoint::protocol::kFramesPerPacket;
+                        recovered_header.fec_shard_index = static_cast<std::uint8_t>(
+                            missing_index);
+                        auto recovered = multipoint::protocol::decode_audio_payload(
+                            recovered_header, recovered_shard.payload);
+                        if (!recovered) continue;
+                        group.data[missing_index] =
+                            std::move(recovered_shard.payload);
+                        {
+                            std::lock_guard lock(jitter_mutex);
+                            if (jitter.insert(std::move(*recovered))) {
+                                fec_recovered.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                      }
+                    }
+
+                    while (fec_groups.size() > 128) {
+                        fec_groups.erase(fec_groups.begin());
+                    }
                 } catch (const std::exception& error) {
                     std::cerr << "network receive error: " << error.what() << '\n';
                 }
@@ -173,18 +285,33 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, handle_signal);
         std::signal(SIGTERM, handle_signal);
         std::cout << "multipoint receiver listening on UDP port " << port << '\n'
-                  << "Format: 48 kHz stereo float32, 120 frames/packet\n"
+                  << "Format: 48 kHz stereo PCM16 wire / float32 output, "
+                  << multipoint::protocol::kFramesPerPacket << " frames/packet\n"
                   << "Target jitter buffer: " << target_packets << " packets ("
                   << target_packets * packet_ms << " ms)\n"
+                  << "Reorder reserve: " << reorder_packets << " packets ("
+                  << reorder_packets * packet_ms << " ms)\n"
                   << "Using the current macOS default output. Ctrl-C to stop.\n";
 
-        std::vector<float> silence(multipoint::protocol::kSamplesPerPacket, 0.0F);
-        const auto ring_target_frames = std::max<std::size_t>(
-            multipoint::protocol::kFramesPerPacket,
-            (target_packets / 2) * multipoint::protocol::kFramesPerPacket);
+        std::vector<float> concealment(multipoint::protocol::kSamplesPerPacket, 0.0F);
+        constexpr std::size_t plc_history_packets = 4;
+        std::vector<float> plc_history(
+            multipoint::protocol::kSamplesPerPacket * plc_history_packets, 0.0F);
+        std::size_t plc_history_write = 0;
+        std::size_t plc_history_samples = 0;
+        std::size_t plc_replay_read = 0;
+        std::array<float, multipoint::protocol::kChannelCount> last_output{};
+        std::uint64_t concealed_packets = 0;
+        const auto ring_packets = std::max<std::size_t>(
+            1, target_packets - reorder_packets);
+        const auto ring_target_frames =
+            ring_packets * multipoint::protocol::kFramesPerPacket;
         auto next_stats = std::chrono::steady_clock::now() + std::chrono::seconds(1);
         bool playout_started = false;
         std::size_t consecutive_missing = 0;
+        std::optional<std::chrono::steady_clock::time_point> missing_since;
+        bool gap_grace_exhausted = false;
+        const auto reorder_grace = std::chrono::milliseconds(30);
 
         while (g_running) {
             // CoreAudio is the playout clock. Keep a small amount of decoded
@@ -198,13 +325,29 @@ int main(int argc, char** argv) {
             multipoint::jitter::PopResult result;
             {
                 std::lock_guard lock(jitter_mutex);
-                // A relay can deliver a large burst after an outage. Audio
-                // older than twice the target delay is no longer useful;
-                // shedding it prevents a permanent latency/overflow spiral.
-                if (jitter.depth() > target_packets * 2) {
-                    jitter.discard_oldest_until(target_packets);
+                // Keep a generous emergency ceiling. Normal clock drift must
+                // be corrected gradually; bulk-dropping at twice the target
+                // produced an audible discontinuity during short Wi-Fi stalls.
+                if (jitter.depth() > target_packets * 4) {
+                    jitter.discard_oldest_until(target_packets * 2);
                 }
-                result = jitter.pop();
+                result = jitter.pop(false);
+                if (result.status == multipoint::jitter::PopStatus::not_ready &&
+                    jitter.started()) {
+                    if (gap_grace_exhausted) {
+                        result = jitter.pop(true);
+                    } else {
+                        const auto now = std::chrono::steady_clock::now();
+                        if (!missing_since) missing_since = now;
+                        if (now - *missing_since >= reorder_grace) {
+                            gap_grace_exhausted = true;
+                            result = jitter.pop(true);
+                        }
+                    }
+                } else if (result.packet) {
+                    missing_since.reset();
+                    gap_grace_exhausted = false;
+                }
             }
             if (result.status == multipoint::jitter::PopStatus::not_ready) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -212,13 +355,103 @@ int main(int argc, char** argv) {
             }
 
             if (result.packet) {
+                auto& samples = result.packet->interleaved_samples;
+                if (consecutive_missing > 0) {
+                    constexpr std::size_t fade_frames = 48;
+                    for (std::size_t frame = 0; frame < fade_frames; ++frame) {
+                        const auto gain = static_cast<float>(frame + 1) /
+                            static_cast<float>(fade_frames);
+                        for (std::size_t channel = 0;
+                             channel < multipoint::protocol::kChannelCount;
+                             ++channel) {
+                            const auto index = frame *
+                                multipoint::protocol::kChannelCount + channel;
+                            samples[index] = last_output[channel] * (1.0F - gain) +
+                                samples[index] * gain;
+                        }
+                    }
+                }
                 consecutive_missing = 0;
                 audio.ring.write(
-                    result.packet->interleaved_samples.data(),
+                    samples.data(),
                     multipoint::protocol::kFramesPerPacket);
+                for (const auto sample : samples) {
+                    plc_history[plc_history_write] = sample;
+                    plc_history_write = (plc_history_write + 1) % plc_history.size();
+                    plc_history_samples = std::min(
+                        plc_history_samples + 1, plc_history.size());
+                }
+                for (std::size_t channel = 0;
+                     channel < multipoint::protocol::kChannelCount;
+                     ++channel) {
+                    last_output[channel] = samples[
+                        (multipoint::protocol::kFramesPerPacket - 1) *
+                        multipoint::protocol::kChannelCount + channel];
+                }
             } else {
                 ++consecutive_missing;
-                audio.ring.write(silence.data(), multipoint::protocol::kFramesPerPacket);
+                ++concealed_packets;
+                std::fill(concealment.begin(), concealment.end(), 0.0F);
+                constexpr std::size_t maximum_replay_packets = 10;
+                if (plc_history_samples == plc_history.size() &&
+                    consecutive_missing <= maximum_replay_packets) {
+                    if (consecutive_missing == 1) {
+                        plc_replay_read = plc_history_write;
+                    }
+                    for (auto& sample : concealment) {
+                        sample = plc_history[plc_replay_read];
+                        plc_replay_read = (plc_replay_read + 1) % plc_history.size();
+                    }
+
+                    if (consecutive_missing == 1) {
+                        constexpr std::size_t fade_frames = 48;
+                        for (std::size_t frame = 0; frame < fade_frames; ++frame) {
+                            const auto gain = static_cast<float>(frame + 1) /
+                                static_cast<float>(fade_frames);
+                            for (std::size_t channel = 0;
+                                 channel < multipoint::protocol::kChannelCount;
+                                 ++channel) {
+                                const auto index = frame *
+                                    multipoint::protocol::kChannelCount + channel;
+                                concealment[index] = last_output[channel] * (1.0F - gain) +
+                                    concealment[index] * gain;
+                            }
+                        }
+                    }
+
+                    if (consecutive_missing > maximum_replay_packets - 2) {
+                        const auto packets_into_fade = consecutive_missing -
+                            (maximum_replay_packets - 2);
+                        for (std::size_t frame = 0;
+                             frame < multipoint::protocol::kFramesPerPacket;
+                             ++frame) {
+                            const auto fade_position =
+                                (packets_into_fade - 1) *
+                                    multipoint::protocol::kFramesPerPacket + frame + 1;
+                            const auto fade_total = 2 *
+                                multipoint::protocol::kFramesPerPacket;
+                            const auto gain = std::max(
+                                0.0F,
+                                1.0F - static_cast<float>(fade_position) /
+                                    static_cast<float>(fade_total));
+                            for (std::size_t channel = 0;
+                                 channel < multipoint::protocol::kChannelCount;
+                                 ++channel) {
+                                concealment[frame *
+                                    multipoint::protocol::kChannelCount + channel] *= gain;
+                            }
+                        }
+                    }
+                }
+                audio.ring.write(
+                    concealment.data(), multipoint::protocol::kFramesPerPacket);
+                for (std::size_t channel = 0;
+                     channel < multipoint::protocol::kChannelCount;
+                     ++channel) {
+                    last_output[channel] = concealment[
+                        (multipoint::protocol::kFramesPerPacket - 1) *
+                        multipoint::protocol::kChannelCount + channel];
+                }
             }
 
             if (!playout_started &&
@@ -229,7 +462,7 @@ int main(int argc, char** argv) {
                         std::chrono::seconds(1);
             }
 
-            if (consecutive_missing >= target_packets) {
+            if (consecutive_missing >= reorder_packets) {
                 bool empty = false;
                 bool advanced = false;
                 {
@@ -246,6 +479,8 @@ int main(int argc, char** argv) {
                     audio.ring.discard();
                     playout_started = false;
                     consecutive_missing = 0;
+                    missing_since.reset();
+                    gap_grace_exhausted = false;
                     continue;
                 }
                 if (advanced) consecutive_missing = 0;
@@ -262,6 +497,12 @@ int main(int argc, char** argv) {
                           << " duplicate=" << stats.duplicate_packets
                           << " overflow=" << stats.overflow_drops
                           << " latency_drop=" << stats.latency_drops
+                          << " concealed=" << concealed_packets
+                          << " fec_recovered=" << fec_recovered.load()
+                          << " max_arrival_gap_ms=" << std::fixed
+                          << std::setprecision(1)
+                          << static_cast<double>(max_arrival_gap_ns.load()) / 1'000'000.0
+                          << " arrival_gap_events=" << arrival_gap_events.load()
                           << " depth=" << jitter.depth()
                           << " ring_frames=" << audio.ring.available_to_read()
                           << " underruns=" << audio.ring.underruns()

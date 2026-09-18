@@ -1,5 +1,6 @@
 add_library(multipoint_core STATIC
     protocol/audio_packet.cpp
+    protocol/fec.cpp
     jitter/jitter_buffer.cpp
     network/udp_socket_posix.cpp
 )

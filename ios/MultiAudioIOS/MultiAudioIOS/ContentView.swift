@@ -16,6 +16,9 @@ struct ContentView: View {
                     LabeledContent("Packets sent", value: capture.packetsSent.formatted())
                     LabeledContent("Queue drops", value: capture.queueDrops.formatted())
                     LabeledContent("Conversion drops", value: capture.conversionDrops.formatted())
+                    LabeledContent("Packet rate", value: capture.packetRate)
+                    LabeledContent("Max send queue", value: capture.maxQueueDepth.formatted())
+                    LabeledContent("Pacer underruns", value: capture.pacingUnderruns.formatted())
                 }
 
                 Section("Capture") {
@@ -29,6 +32,10 @@ struct ContentView: View {
                         LabeledContent("Peak level", value: capture.latestPeakLevel)
                         LabeledContent("PTS", value: capture.latestPTS)
                         LabeledContent("Duration", value: capture.latestDuration)
+                        LabeledContent("Host capture rate", value: capture.captureHostRate)
+                        LabeledContent("Media capture rate", value: capture.captureMediaRate)
+                        LabeledContent("Max callback gap", value: capture.maxCallbackGap)
+                        LabeledContent("Max PTS error", value: capture.maxPTSError)
                     }
                 }
 

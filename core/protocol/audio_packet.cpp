@@ -1,6 +1,8 @@
 #include "multipoint/protocol/audio_packet.h"
 
 #include <bit>
+#include <algorithm>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 
@@ -82,21 +84,30 @@ std::vector<std::byte> serialize(const AudioPacket& packet) {
     const auto expected_samples =
         static_cast<std::size_t>(packet.header.frames_per_packet) *
         packet.header.channel_count;
-    if (packet.interleaved_samples.size() != expected_samples) {
-        throw std::invalid_argument("sample count does not match packet header");
-    }
-    if (expected_samples > std::numeric_limits<std::uint32_t>::max() / sizeof(float)) {
+    if (expected_samples > std::numeric_limits<std::uint32_t>::max() / sizeof(std::int16_t)) {
         throw std::invalid_argument("payload is too large");
     }
 
+    const bool is_audio = packet.header.packet_type == kAudioPacketType;
+    const bool is_parity = packet.header.packet_type == kFecParityPacketType;
+    if (!is_audio && !is_parity) {
+        throw std::invalid_argument("unsupported packet type");
+    }
+    if (is_audio && packet.interleaved_samples.size() != expected_samples) {
+        throw std::invalid_argument("sample count does not match packet header");
+    }
+    if (is_parity && packet.encoded_payload.size() != kPayloadBytes) {
+        throw std::invalid_argument("parity payload has wrong size");
+    }
+
     const auto payload_size =
-        static_cast<std::uint32_t>(expected_samples * sizeof(float));
+        static_cast<std::uint32_t>(expected_samples * sizeof(std::int16_t));
     std::vector<std::byte> bytes;
     bytes.reserve(kHeaderSize + payload_size);
     Writer writer(bytes);
     writer.u32(kMagic);
     writer.u8(kProtocolVersion);
-    writer.u8(kAudioPacketType);
+    writer.u8(packet.header.packet_type);
     writer.u16(kHeaderSize);
     writer.u64(packet.header.stream_id);
     writer.u32(packet.header.sequence);
@@ -106,11 +117,48 @@ std::vector<std::byte> serialize(const AudioPacket& packet) {
     writer.u16(packet.header.channel_count);
     writer.u16(packet.header.frames_per_packet);
     writer.u32(payload_size);
+    writer.u8(packet.header.fec_data_shards);
+    writer.u8(packet.header.fec_parity_shards);
+    writer.u8(packet.header.fec_shard_index);
+    writer.u8(0);
 
-    for (const float sample : packet.interleaved_samples) {
-        writer.u32(std::bit_cast<std::uint32_t>(sample));
+    if (is_audio) {
+        for (const float sample : packet.interleaved_samples) {
+            const auto clamped = std::clamp(sample, -1.0F, 1.0F);
+            const auto quantized = static_cast<std::int16_t>(std::lrint(
+                clamped * (clamped < 0.0F ? 32'768.0F : 32'767.0F)));
+            writer.u16(std::bit_cast<std::uint16_t>(quantized));
+        }
+    } else {
+        bytes.insert(
+            bytes.end(), packet.encoded_payload.begin(), packet.encoded_payload.end());
     }
     return bytes;
+}
+
+std::optional<AudioPacket> decode_audio_payload(
+    AudioPacketHeader header,
+    std::span<const std::byte> encoded_payload) {
+    if (header.packet_type != kAudioPacketType ||
+        header.sample_rate != kSampleRate ||
+        header.channel_count != kChannelCount ||
+        header.frames_per_packet != kFramesPerPacket ||
+        encoded_payload.size() != kPayloadBytes) {
+        return std::nullopt;
+    }
+
+    AudioPacket packet;
+    packet.header = header;
+    packet.encoded_payload.assign(encoded_payload.begin(), encoded_payload.end());
+    packet.interleaved_samples.resize(kSamplesPerPacket);
+    Reader payload_reader(encoded_payload);
+    for (auto& sample : packet.interleaved_samples) {
+        std::uint16_t bits = 0;
+        if (!payload_reader.u16(bits)) return std::nullopt;
+        const auto quantized = std::bit_cast<std::int16_t>(bits);
+        sample = static_cast<float>(quantized) / 32'768.0F;
+    }
+    return packet;
 }
 
 DecodeResult deserialize(std::span<const std::byte> datagram) {
@@ -132,13 +180,21 @@ DecodeResult deserialize(std::span<const std::byte> datagram) {
         !reader.u32(packet.header.sample_rate) ||
         !reader.u16(packet.header.channel_count) ||
         !reader.u16(packet.header.frames_per_packet) ||
-        !reader.u32(payload_size)) {
+        !reader.u32(payload_size) ||
+        !reader.u8(packet.header.fec_data_shards) ||
+        !reader.u8(packet.header.fec_parity_shards) ||
+        !reader.u8(packet.header.fec_shard_index)) {
         return failure("truncated header");
     }
+    std::uint8_t reserved = 0;
+    if (!reader.u8(reserved)) return failure("truncated header");
+    packet.header.packet_type = packet_type;
 
     if (magic != kMagic) return failure("invalid magic");
     if (version != kProtocolVersion) return failure("unsupported protocol version");
-    if (packet_type != kAudioPacketType) return failure("unsupported packet type");
+    if (packet_type != kAudioPacketType && packet_type != kFecParityPacketType) {
+        return failure("unsupported packet type");
+    }
     if (header_size != kHeaderSize) return failure("unsupported header size");
     if (packet.header.sample_rate != kSampleRate ||
         packet.header.channel_count != kChannelCount ||
@@ -146,15 +202,21 @@ DecodeResult deserialize(std::span<const std::byte> datagram) {
         return failure("unsupported audio format");
     }
     if (payload_size != kPayloadBytes) return failure("invalid payload size");
+    if (packet.header.fec_data_shards != kFecDataShards ||
+        packet.header.fec_parity_shards != kFecParityShards ||
+        packet.header.fec_shard_index >= kFecDataShards + kFecParityShards) {
+        return failure("unsupported FEC layout");
+    }
     if (datagram.size() != static_cast<std::size_t>(header_size) + payload_size) {
         return failure("datagram size does not match payload size");
     }
 
-    packet.interleaved_samples.resize(kSamplesPerPacket);
-    for (auto& sample : packet.interleaved_samples) {
-        std::uint32_t bits = 0;
-        if (!reader.u32(bits)) return failure("truncated PCM payload");
-        sample = std::bit_cast<float>(bits);
+    const auto payload = datagram.subspan(header_size, payload_size);
+    packet.encoded_payload.assign(payload.begin(), payload.end());
+    if (packet_type == kAudioPacketType) {
+        auto decoded = decode_audio_payload(packet.header, payload);
+        if (!decoded) return failure("truncated PCM payload");
+        return {.packet = std::move(decoded), .error = {}};
     }
     return {.packet = std::move(packet), .error = {}};
 }

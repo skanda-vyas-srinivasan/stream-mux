@@ -2,7 +2,6 @@ import Combine
 import AudioToolbox
 import CoreMedia
 import Foundation
-import OSLog
 @preconcurrency import ScreenCaptureKit
 
 @MainActor
@@ -16,12 +15,23 @@ final class CaptureManager: NSObject, ObservableObject {
     @Published private(set) var latestDuration = "—"
     @Published private(set) var latestRMSLevel = "—"
     @Published private(set) var latestPeakLevel = "—"
-    @Published var receiverHost = "172.16.101.195"
-    @Published var receiverPort = "48100"
+    @Published var receiverHost: String {
+        didSet { UserDefaults.standard.set(receiverHost, forKey: "receiverHost") }
+    }
+    @Published var receiverPort: String {
+        didSet { UserDefaults.standard.set(receiverPort, forKey: "receiverPort") }
+    }
     @Published private(set) var transportState = "Stopped"
     @Published private(set) var packetsSent: UInt64 = 0
     @Published private(set) var queueDrops: UInt64 = 0
     @Published private(set) var conversionDrops: UInt64 = 0
+    @Published private(set) var captureHostRate = "—"
+    @Published private(set) var captureMediaRate = "—"
+    @Published private(set) var maxCallbackGap = "—"
+    @Published private(set) var maxPTSError = "—"
+    @Published private(set) var packetRate = "—"
+    @Published private(set) var maxQueueDepth = 0
+    @Published private(set) var pacingUnderruns: UInt64 = 0
     @Published var errorMessage: String?
 
     private let picker = SCContentSharingPicker.shared
@@ -34,6 +44,8 @@ final class CaptureManager: NSObject, ObservableObject {
     nonisolated private let transportPipeline = AudioTransportPipeline()
 
     override init() {
+        receiverHost = UserDefaults.standard.string(forKey: "receiverHost") ?? "10.0.0.14"
+        receiverPort = UserDefaults.standard.string(forKey: "receiverPort") ?? "48100"
         super.init()
         pickerObserver = CapturePickerObserver(manager: self)
     }
@@ -153,6 +165,13 @@ final class CaptureManager: NSObject, ObservableObject {
         queueDrops = transport.queueDrops
         conversionDrops = transport.conversionDrops
         transportState = transport.state
+        captureHostRate = String(format: "%.0f frames/s", transport.captureHostRate)
+        captureMediaRate = String(format: "%.0f frames/s", transport.captureMediaRate)
+        maxCallbackGap = String(format: "%.1f ms", transport.maxCallbackGapMS)
+        maxPTSError = String(format: "%.1f ms", transport.maxPTSErrorMS)
+        packetRate = String(format: "%.1f packets/s", transport.packetRate)
+        maxQueueDepth = transport.maxQueueDepth
+        pacingUnderruns = transport.pacingUnderruns
     }
 }
 
@@ -169,7 +188,9 @@ extension CaptureManager: SCStreamOutput {
 
         let metadata = AudioBufferMetadata(sampleBuffer: sampleBuffer)
         let transport = transportPipeline.consume(sampleBuffer)
-        AudioCaptureLog.log(metadata)
+#if DEBUG
+        USBMetricLogger.record(metadata: metadata, transport: transport)
+#endif
 
         Task { @MainActor [weak self] in
             self?.receivedAudio(metadata, transport: transport)
@@ -187,7 +208,7 @@ extension CaptureManager: SCStreamDelegate {
     }
 }
 
-fileprivate struct AudioBufferMetadata: Sendable {
+struct AudioBufferMetadata: Sendable {
     let sampleRate: Double
     let channelCount: UInt32
     let formatID: String
@@ -363,28 +384,6 @@ fileprivate struct AudioBufferMetadata: Sendable {
             return String(bytes: bytes, encoding: .ascii) ?? "unknown"
         }
         return String(format: "0x%08x", value)
-    }
-}
-
-private enum AudioCaptureLog {
-    private static let logger = Logger(
-        subsystem: "com.skandavyas.multipoint.ios",
-        category: "MultiAudioCapture"
-    )
-    private static let lock = NSLock()
-    private nonisolated(unsafe) static var bufferCount: UInt64 = 0
-    private nonisolated(unsafe) static var lastLogTime: TimeInterval = 0
-
-    static func log(_ metadata: AudioBufferMetadata) {
-        let now = ProcessInfo.processInfo.systemUptime
-        lock.lock()
-        bufferCount &+= 1
-        let shouldLog = bufferCount == 1 || now - lastLogTime >= 1
-        if shouldLog { lastLogTime = now }
-        lock.unlock()
-
-        guard shouldLog else { return }
-        logger.info("audio sampleRate=\(metadata.sampleRate) channels=\(metadata.channelCount) format=\(metadata.formatID, privacy: .public) flags=0x\(String(metadata.formatFlags, radix: 16), privacy: .public) frames=\(metadata.frameCount) pts=\(metadata.presentationTimestampSeconds) duration=\(metadata.durationSeconds) rmsDBFS=\(metadata.rmsDBFS ?? -.infinity) peakDBFS=\(metadata.peakDBFS ?? -.infinity)")
     }
 }
 

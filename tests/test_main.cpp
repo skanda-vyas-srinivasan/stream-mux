@@ -1,6 +1,7 @@
 #include "multipoint/audio/spsc_audio_ring.h"
 #include "multipoint/jitter/jitter_buffer.h"
 #include "multipoint/protocol/audio_packet.h"
+#include "multipoint/protocol/fec.h"
 #include "multipoint/util/sequence.h"
 
 #include <cmath>
@@ -22,6 +23,8 @@ multipoint::protocol::AudioPacket make_packet(std::uint32_t sequence) {
     multipoint::protocol::AudioPacket packet;
     packet.header.stream_id = 42;
     packet.header.sequence = sequence;
+    packet.header.fec_shard_index = static_cast<std::uint8_t>(
+        sequence % multipoint::protocol::kFecDataShards);
     packet.header.sender_timestamp_ns = 123'456 + sequence;
     packet.header.sample_index =
         static_cast<std::uint64_t>(sequence) * multipoint::protocol::kFramesPerPacket;
@@ -30,6 +33,44 @@ multipoint::protocol::AudioPacket make_packet(std::uint32_t sequence) {
         packet.interleaved_samples[index] = static_cast<float>(index) / 1000.0F;
     }
     return packet;
+}
+
+void test_fec_pair_recovery() {
+    std::array<std::optional<std::vector<std::byte>>,
+               multipoint::protocol::kFecDataShards> data;
+    std::array<std::vector<std::byte>,
+               multipoint::protocol::kFecDataShards> originals;
+    multipoint::protocol::FecDataPayloads spans;
+    for (std::size_t index = 0; index < data.size(); ++index) {
+        auto packet = make_packet(100 + static_cast<std::uint32_t>(index));
+        packet.header.fec_shard_index = static_cast<std::uint8_t>(index);
+        auto decoded = multipoint::protocol::deserialize(
+            multipoint::protocol::serialize(packet));
+        require(decoded.packet.has_value(), "FEC source decode failed");
+        originals[index] = decoded.packet->encoded_payload;
+        data[index] = originals[index];
+        spans[index] = originals[index];
+    }
+
+    std::array<std::optional<std::vector<std::byte>>,
+               multipoint::protocol::kFecParityShards> parity;
+    for (std::size_t index = 0; index < parity.size(); ++index) {
+        parity[index] = std::vector<std::byte>(
+            multipoint::protocol::kPayloadBytes);
+        require(multipoint::protocol::encode_fec_parity(
+                    spans, static_cast<std::uint8_t>(index), *parity[index]),
+                "parity generation failed");
+    }
+
+    constexpr std::array<std::size_t, 5> missing = {0, 2, 5, 7, 9};
+    for (const auto index : missing) data[index].reset();
+    const auto recovered = multipoint::protocol::recover_fec_data(data, parity);
+    require(recovered.has_value(), "five-shard FEC recovery failed");
+    require(recovered->size() == missing.size(), "wrong recovered shard count");
+    for (const auto& shard : *recovered) {
+        require(shard.payload == originals[shard.data_index],
+                "FEC did not reconstruct exact PCM16 bytes");
+    }
 }
 
 void test_packet_round_trip() {
@@ -41,8 +82,11 @@ void test_packet_round_trip() {
     require(decoded.packet->header.sequence == 99, "sequence did not round trip");
     require(decoded.packet->header.sample_index == original.header.sample_index,
             "sample index did not round trip");
-    require(decoded.packet->interleaved_samples == original.interleaved_samples,
-            "PCM payload did not round trip");
+    for (std::size_t index = 0; index < original.interleaved_samples.size(); ++index) {
+        require(std::abs(decoded.packet->interleaved_samples[index] -
+                         original.interleaved_samples[index]) <= 1.0F / 32'767.0F,
+                "PCM16 payload exceeded quantization tolerance");
+    }
 }
 
 void test_packet_rejection() {
@@ -83,6 +127,17 @@ void test_jitter_reorder_loss_and_duplicate() {
     require(jitter.stats().duplicate_packets == 1, "duplicate statistic wrong");
     require(jitter.stats().packets_lost == 1, "loss statistic wrong");
     require(jitter.stats().late_packets == 1, "late statistic wrong");
+
+    multipoint::jitter::JitterBuffer grace(2, 16);
+    require(grace.insert(make_packet(50)), "grace insert 50 failed");
+    require(grace.insert(make_packet(52)), "grace insert 52 failed");
+    require(grace.pop().packet->header.sequence == 50, "grace start failed");
+    require(grace.pop(false).status == multipoint::jitter::PopStatus::not_ready,
+            "missing packet was declared during grace period");
+    require(grace.stats().packets_lost == 0, "grace period counted a loss");
+    require(grace.insert(make_packet(51)), "grace rejected delayed packet");
+    require(grace.pop().packet->header.sequence == 51,
+            "grace period advanced past delayed packet");
 
     const auto received_before_rebuffer = jitter.stats().packets_received;
     jitter.rebuffer();
@@ -132,6 +187,7 @@ int main() {
     try {
         test_packet_round_trip();
         test_packet_rejection();
+        test_fec_pair_recovery();
         test_sequence_wrap();
         test_jitter_reorder_loss_and_duplicate();
         test_jitter_latency_recovery();

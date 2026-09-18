@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <netdb.h>
 #include <stdexcept>
 #include <sys/socket.h>
@@ -30,6 +31,14 @@ UdpSender::UdpSender(const std::string& host, std::uint16_t port) {
     for (auto* address = result; address != nullptr; address = address->ai_next) {
         fd_ = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
         if (fd_ < 0) continue;
+        const int send_buffer_bytes = 1 << 20;
+        setsockopt(
+            fd_, SOL_SOCKET, SO_SNDBUF,
+            &send_buffer_bytes, sizeof(send_buffer_bytes));
+        const int flags = fcntl(fd_, F_GETFL, 0);
+        if (flags >= 0) {
+            fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+        }
         if (connect(fd_, address->ai_addr, address->ai_addrlen) == 0) break;
         close(fd_);
         fd_ = -1;
@@ -55,6 +64,10 @@ UdpReceiver::UdpReceiver(std::uint16_t port) {
 
     int disabled = 0;
     setsockopt(fd_, IPPROTO_IPV6, IPV6_V6ONLY, &disabled, sizeof(disabled));
+    const int receive_buffer_bytes = 1 << 20;
+    setsockopt(
+        fd_, SOL_SOCKET, SO_RCVBUF,
+        &receive_buffer_bytes, sizeof(receive_buffer_bytes));
     timeval timeout{.tv_sec = 0, .tv_usec = 100'000};
     setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 

@@ -31,7 +31,9 @@ public:
     explicit JitterBuffer(std::size_t target_packets, std::size_t capacity_packets);
 
     bool insert(protocol::AudioPacket packet);
-    [[nodiscard]] PopResult pop();
+    // When declare_missing is false, an absent next packet is held for a
+    // short receiver-controlled reorder grace period instead of advancing.
+    [[nodiscard]] PopResult pop(bool declare_missing = true);
     [[nodiscard]] std::size_t depth() const { return packets_.size(); }
     [[nodiscard]] bool started() const { return started_; }
     [[nodiscard]] const JitterStats& stats() const { return stats_; }
