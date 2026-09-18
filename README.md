@@ -1,6 +1,6 @@
 # Linkverge
 
-`multipoint` is a peer-to-peer, low-latency audio-routing project. The first
+`LinkVerge` is a peer-to-peer, low-latency audio-routing project. The first
 milestone is intentionally limited to capturing iPhone system audio with
 ScreenCaptureKit on iOS 27. Networking and macOS playback begin only after the
 capture probe works on a physical iPhone.
