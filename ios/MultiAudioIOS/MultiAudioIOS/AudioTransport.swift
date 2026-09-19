@@ -63,6 +63,7 @@ final class AudioTransportPipeline: @unchecked Sendable {
     private var minimumCaptureOffsetSeconds: Double?
     private var recoveringFromDiscontinuity = false
     private var freshCaptureSinceNS: UInt64?
+    private var freshCapturePTSSeconds: Double?
     private var captureDiscontinuities: UInt64 = 0
     private var staleCaptureDrops: UInt64 = 0
     private var captureIngressDrops: UInt64 = 0
@@ -71,7 +72,10 @@ final class AudioTransportPipeline: @unchecked Sendable {
     // mean ScreenCaptureKit has stopped delivering real-time audio.
     private static let discontinuityThresholdNS: UInt64 = 250_000_000
     private static let maximumCaptureAgeSeconds = 0.150
-    private static let recoveryStablePeriodNS: UInt64 = 3_000_000_000
+    // Resume only after PTS and host time have advanced together long enough
+    // to prove that ScreenCaptureKit's post-stall catch-up burst has ended.
+    private static let recoveryStablePeriodNS: UInt64 = 500_000_000
+    private static let recoveryTimelineToleranceSeconds = 0.040
     private static let maximumQueuedCaptures = 8
 
     func start(host: String, port: UInt16) {
@@ -94,6 +98,7 @@ final class AudioTransportPipeline: @unchecked Sendable {
                 minimumCaptureOffsetSeconds = nil
                 recoveringFromDiscontinuity = false
                 freshCaptureSinceNS = nil
+                freshCapturePTSSeconds = nil
                 captureDiscontinuities = 0
                 staleCaptureDrops = 0
                 captureIngressDrops = 0
@@ -213,6 +218,7 @@ final class AudioTransportPipeline: @unchecked Sendable {
             if captureIsUnstable && !recoveringFromDiscontinuity {
                 recoveringFromDiscontinuity = true
                 freshCaptureSinceNS = nil
+                freshCapturePTSSeconds = nil
                 captureDiscontinuities &+= 1
                 discardTransport = true
                 // ScreenCaptureKit may permanently omit media time during the
@@ -224,16 +230,30 @@ final class AudioTransportPipeline: @unchecked Sendable {
             if recoveringFromDiscontinuity {
                 if captureIsUnstable {
                     freshCaptureSinceNS = nil
-                } else {
-                    if freshCaptureSinceNS == nil {
+                    freshCapturePTSSeconds = nil
+                } else if pts.isFinite {
+                    if freshCaptureSinceNS == nil || freshCapturePTSSeconds == nil {
                         freshCaptureSinceNS = timestamp
+                        freshCapturePTSSeconds = pts
                     }
-                    if let freshCaptureSinceNS,
-                       timestamp - freshCaptureSinceNS >=
-                           Self.recoveryStablePeriodNS {
-                        recoveringFromDiscontinuity = false
-                        self.freshCaptureSinceNS = nil
-                        resumeWithNewStream = true
+                    if let freshCaptureSinceNS, let freshCapturePTSSeconds {
+                        let hostProgress = Double(timestamp - freshCaptureSinceNS) /
+                            1_000_000_000
+                        let mediaProgress = pts - freshCapturePTSSeconds
+                        let timelineError = abs(mediaProgress - hostProgress)
+                        if mediaProgress < 0 || timelineError >
+                            Self.recoveryTimelineToleranceSeconds {
+                            // PTS is still catching up faster than buffers are
+                            // arriving. Start a new candidate stability window.
+                            self.freshCaptureSinceNS = timestamp
+                            self.freshCapturePTSSeconds = pts
+                        } else if timestamp - freshCaptureSinceNS >=
+                            Self.recoveryStablePeriodNS {
+                            recoveringFromDiscontinuity = false
+                            self.freshCaptureSinceNS = nil
+                            self.freshCapturePTSSeconds = nil
+                            resumeWithNewStream = true
+                        }
                     }
                 }
                 if recoveringFromDiscontinuity {

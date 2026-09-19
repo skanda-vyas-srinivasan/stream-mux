@@ -203,6 +203,20 @@ September 19. An app-switch audio stress test is still required before claiming
 the audible artifact is fixed; this refactor establishes the shared transport
 boundary but does not make ScreenCaptureKit callback stalls disappear.
 
+The first physical app-switch test after this refactor recorded a 633.9 ms
+capture callback gap and 420 ms PTS discontinuity. Capture resets and receiver
+hard resyncs both increased by two, proving the epoch transition worked, but
+the Mac saw a 5.674-second arrival gap and the iPhone discarded 378 capture
+buffers. The fixed three-second clean window was magnifying the source stall.
+
+The installed follow-up build replaces that fixed delay with a timeline-based
+gate. During recovery it compares cumulative PTS progress with monotonic host
+progress, keeps rejecting a catch-up burst while those clocks diverge by more
+than 40 ms, and resumes on a new epoch after 500 ms of genuinely real-time
+progress. This build compiles, signs, installs, and launches successfully, but
+still needs the same physical app-switch listening test before its audible
+behavior is considered validated.
+
 ## Exact current runtime state
 
 - The iPhone 13 was visible through CoreDevice over USB as connected at the
