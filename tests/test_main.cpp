@@ -64,7 +64,7 @@ void test_fec_pair_recovery() {
                 "parity generation failed");
     }
 
-    constexpr std::array<std::size_t, 5> missing = {0, 1, 2, 3, 4};
+    constexpr std::array<std::size_t, 5> missing = {0, 2, 5, 7, 9};
     for (const auto index : missing) data[index].reset();
     const auto recovered = multipoint::protocol::recover_fec_data(data, parity);
     require(recovered.has_value(), "five-shard FEC recovery failed");
@@ -96,7 +96,7 @@ void test_sender_engine_packetization_and_epoch_reset() {
     std::vector<float> samples(
         multipoint::protocol::kSamplesPerPacket * 20, 0.25F);
     const auto datagrams = sender.push_audio(samples, 123'000);
-    require(datagrams.size() == 35, "sender emitted wrong audio/parity count");
+    require(datagrams.size() == 25, "sender emitted wrong audio/parity count");
 
     std::size_t audio_count = 0;
     std::size_t parity_count = 0;
@@ -110,16 +110,13 @@ void test_sender_engine_packetization_and_epoch_reset() {
                     "sender audio sequence wrong");
             ++audio_count;
         } else {
-            const auto expected_group =
-                (parity_count / multipoint::protocol::kFecParityShards) *
-                multipoint::protocol::kFecDataShards;
-            require(decoded.packet->header.sequence == expected_group,
+            require(decoded.packet->header.sequence == 0,
                     "delayed parity protected wrong group");
             ++parity_count;
         }
     }
     require(audio_count == 20, "sender audio count wrong");
-    require(parity_count == 15, "sender parity count wrong");
+    require(parity_count == 5, "sender parity count wrong");
 
     sender.reset_stream(9002);
     const auto after_reset = sender.push_audio(
@@ -199,6 +196,7 @@ void test_receiver_engine_sequence_gap_resync() {
     });
     auto first = make_packet(0);
     auto distant = make_packet(8);
+    distant.header.fec_shard_index = 8;
     require(!receiver.ingest(multipoint::protocol::serialize(first), 1'000).hard_resync,
             "first receiver packet unexpectedly resynced");
     require(receiver.ingest(multipoint::protocol::serialize(distant), 2'000).hard_resync,

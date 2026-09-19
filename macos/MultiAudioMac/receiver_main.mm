@@ -137,7 +137,7 @@ private:
 int main(int argc, char** argv) {
     try {
         const auto port = static_cast<std::uint16_t>(argc > 1 ? std::stoi(argv[1]) : 48100);
-        const auto target_latency_ms = argc > 2 ? std::stoi(argv[2]) : 100;
+        const auto target_latency_ms = argc > 2 ? std::stoi(argv[2]) : 40;
         const auto packet_ms = 1000.0 * multipoint::protocol::kFramesPerPacket /
             multipoint::protocol::kSampleRate;
         const auto target_packets = std::max<std::size_t>(
@@ -219,11 +219,7 @@ int main(int argc, char** argv) {
         std::size_t consecutive_missing = 0;
         std::optional<std::chrono::steady_clock::time_point> missing_since;
         bool gap_grace_exhausted = false;
-        // Parity is intentionally released one FEC group after its audio so a
-        // short radio blackout does not erase both. Reserve most of the target
-        // latency for that separated copy while retaining a playout cushion.
-        const auto reorder_grace = std::chrono::milliseconds(
-            std::max(1, target_latency_ms * 3 / 5));
+        const auto reorder_grace = std::chrono::milliseconds(30);
         std::uint64_t observed_resync_generation = 0;
 
         while (g_running) {

@@ -13,7 +13,7 @@ enum {
     MPAudioFramesPerPacket = 240,
     MPAudioChannelCount = 2,
     MPAudioSamplesPerPacket = MPAudioFramesPerPacket * MPAudioChannelCount,
-    MPAudioFECDataShards = 5,
+    MPAudioFECDataShards = 10,
     MPAudioFECParityShards = 5,
     MPAudioDatagramSize = 52 + MPAudioSamplesPerPacket * 2,
 };

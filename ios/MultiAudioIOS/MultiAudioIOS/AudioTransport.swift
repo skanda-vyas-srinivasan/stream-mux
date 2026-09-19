@@ -378,7 +378,7 @@ private final class AudioPacketizer {
         guard let engine, !samples.isEmpty else { return [] }
         let packetSamples = Int(MPAudioSamplesPerPacket)
         // The C++ engine may begin with one partial packet and may release five
-        // delayed parity datagrams whenever a five-packet FEC group completes.
+        // delayed parity datagrams whenever a ten-packet FEC group completes.
         let maximumAudioPackets = samples.count / packetSamples + 2
         let maximumParityPackets =
             ((maximumAudioPackets + Int(MPAudioFECDataShards) - 1) /
