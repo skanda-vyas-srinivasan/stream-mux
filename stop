@@ -1,0 +1,39 @@
+#!/bin/zsh
+
+set -euo pipefail
+
+receiver="/Users/skandavyas/multipoint/build/macos/MultiAudioMac/multipoint_receiver"
+port="${1:-48100}"
+
+if (( $# > 1 )); then
+    print -u2 "Usage: stop [port]"
+    exit 2
+fi
+
+if [[ ! "$port" =~ '^[0-9]+$' ]] || (( port < 1 || port > 65535 )); then
+    print -u2 "Invalid UDP port: $port"
+    exit 2
+fi
+
+pid_text="$(lsof -t -nP -iUDP:"$port" 2>/dev/null || true)"
+if [[ -z "$pid_text" ]]; then
+    print "No SoundMux receiver is running on UDP port $port"
+    exit 0
+fi
+
+stopped=0
+for pid in ${(f)pid_text}; do
+    process_command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ "$process_command" != "$receiver" &&
+          "$process_command" != "$receiver "* ]]; then
+        print -u2 "Refusing to stop PID $pid: port $port belongs to another process"
+        continue
+    fi
+    kill -TERM "$pid"
+    print "Stopped SoundMux receiver PID $pid on UDP port $port"
+    stopped=1
+done
+
+if (( stopped == 0 )); then
+    exit 1
+fi

@@ -42,7 +42,8 @@ ctest --test-dir build --output-on-failure
 
 For an interactive zsh configured with the repository shortcut, use `run` for
 the default port `48100` and `100` ms latency, or `run <port> <latency-ms>` to
-override them.
+override them. Use `stop` to stop the receiver on port `48100`, or
+`stop <port>` for a custom port.
 
 Build the iPhone sender from
 `ios/MultiAudioIOS/MultiAudioIOS.xcodeproj` using Xcode 27 and a physical iPhone
