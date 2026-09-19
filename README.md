@@ -40,6 +40,10 @@ ctest --test-dir build --output-on-failure
 ./build/macos/MultiAudioMac/multipoint_receiver 48100 100
 ```
 
+For an interactive zsh configured with the repository shortcut, use `run` for
+the default port `48100` and `100` ms latency, or `run <port> <latency-ms>` to
+override them.
+
 Build the iPhone sender from
 `ios/MultiAudioIOS/MultiAudioIOS.xcodeproj` using Xcode 27 and a physical iPhone
 running iOS 27 or later.

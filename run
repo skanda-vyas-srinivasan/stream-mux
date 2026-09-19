@@ -1,0 +1,30 @@
+#!/bin/zsh
+
+set -euo pipefail
+
+receiver="/Users/skandavyas/multipoint/build/macos/MultiAudioMac/multipoint_receiver"
+port="${1:-48100}"
+latency_ms="${2:-100}"
+
+if (( $# > 2 )); then
+    print -u2 "Usage: run [port] [latency-ms]"
+    exit 2
+fi
+
+if [[ ! "$port" =~ '^[0-9]+$' ]] || (( port < 1 || port > 65535 )); then
+    print -u2 "Invalid UDP port: $port"
+    exit 2
+fi
+
+if [[ ! "$latency_ms" =~ '^[0-9]+$' ]] || (( latency_ms < 1 )); then
+    print -u2 "Invalid latency: $latency_ms ms"
+    exit 2
+fi
+
+if [[ ! -x "$receiver" ]]; then
+    print -u2 "Receiver is not built. Run the project build first."
+    exit 1
+fi
+
+print "Starting SoundMux receiver on UDP port $port with ${latency_ms} ms target latency"
+exec "$receiver" "$port" "$latency_ms"
