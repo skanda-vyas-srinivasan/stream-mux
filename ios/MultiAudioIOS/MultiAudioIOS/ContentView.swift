@@ -61,6 +61,12 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("SoundMux")
+            .safeAreaInset(edge: .bottom) {
+                Text("Stall recovery build")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 4)
+            }
         }
     }
 }

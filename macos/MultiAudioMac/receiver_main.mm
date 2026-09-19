@@ -3,6 +3,7 @@
 #include "multipoint/network/udp_socket.h"
 #include "multipoint/protocol/audio_packet.h"
 #include "multipoint/protocol/fec.h"
+#include "multipoint/util/sequence.h"
 
 #include <AudioToolbox/AudioToolbox.h>
 
@@ -26,6 +27,7 @@ namespace {
 
 constexpr std::size_t kRingCapacityFrames = 48'000;
 constexpr std::size_t kMaxRenderFrames = 8'192;
+constexpr std::uint32_t kHardResyncGapPackets = 20;
 volatile std::sig_atomic_t g_running = 1;
 
 void handle_signal(int) { g_running = 0; }
@@ -167,11 +169,14 @@ int main(int argc, char** argv) {
         std::atomic<std::uint64_t> fec_recovered{0};
         std::atomic<std::uint64_t> max_arrival_gap_ns{0};
         std::atomic<std::uint64_t> arrival_gap_events{0};
+        std::atomic<std::uint64_t> resync_generation{0};
+        std::atomic<std::uint64_t> hard_resyncs{0};
 
         std::thread receive_thread([&] {
             std::array<std::byte, 2'048> datagram{};
             std::optional<std::chrono::steady_clock::time_point> last_arrival;
             std::optional<std::uint64_t> current_stream;
+            std::optional<std::uint32_t> last_audio_sequence;
             std::map<std::uint32_t, FecGroup> fec_groups;
             while (receive_running.load(std::memory_order_relaxed)) {
                 try {
@@ -214,10 +219,16 @@ int main(int argc, char** argv) {
 
                     auto packet = std::move(*decoded.packet);
                     if (!current_stream || *current_stream != packet.header.stream_id) {
+                        const bool replacing_stream = current_stream.has_value();
                         std::lock_guard lock(jitter_mutex);
                         jitter.reset();
                         fec_groups.clear();
                         current_stream = packet.header.stream_id;
+                        last_audio_sequence.reset();
+                        if (replacing_stream) {
+                            hard_resyncs.fetch_add(1, std::memory_order_relaxed);
+                            resync_generation.fetch_add(1, std::memory_order_release);
+                        }
                     }
 
                     const bool is_audio = packet.header.packet_type ==
@@ -230,6 +241,30 @@ int main(int argc, char** argv) {
                               multipoint::protocol::kFecParityShards))) {
                         malformed_packets.fetch_add(1, std::memory_order_relaxed);
                         continue;
+                    }
+
+                    if (is_audio) {
+                        const auto sequence = packet.header.sequence;
+                        if (last_audio_sequence &&
+                            multipoint::util::sequence_after(
+                                sequence, *last_audio_sequence)) {
+                            const auto forward_gap = sequence - *last_audio_sequence;
+                            if (forward_gap > kHardResyncGapPackets) {
+                                {
+                                    std::lock_guard lock(jitter_mutex);
+                                    jitter.rebuffer();
+                                }
+                                fec_groups.clear();
+                                hard_resyncs.fetch_add(1, std::memory_order_relaxed);
+                                resync_generation.fetch_add(
+                                    1, std::memory_order_release);
+                                std::cerr << "Hard resync after sequence gap of "
+                                          << forward_gap << " packets\n";
+                            }
+                            last_audio_sequence = sequence;
+                        } else if (!last_audio_sequence) {
+                            last_audio_sequence = sequence;
+                        }
                     }
 
                     const auto group_base = is_audio
@@ -328,8 +363,25 @@ int main(int argc, char** argv) {
         std::optional<std::chrono::steady_clock::time_point> missing_since;
         bool gap_grace_exhausted = false;
         const auto reorder_grace = std::chrono::milliseconds(30);
+        std::uint64_t observed_resync_generation = 0;
 
         while (g_running) {
+            const auto current_resync_generation =
+                resync_generation.load(std::memory_order_acquire);
+            if (current_resync_generation != observed_resync_generation) {
+                audio.playout_active.store(false, std::memory_order_release);
+                audio.ring.discard();
+                playout_started = false;
+                consecutive_missing = 0;
+                missing_since.reset();
+                gap_grace_exhausted = false;
+                plc_history_write = 0;
+                plc_history_samples = 0;
+                plc_replay_read = 0;
+                std::fill(plc_history.begin(), plc_history.end(), 0.0F);
+                last_output.fill(0.0F);
+                observed_resync_generation = current_resync_generation;
+            }
             // CoreAudio is the playout clock. Keep a small amount of decoded
             // audio ahead of its render callback instead of independently
             // popping the jitter buffer from a sleep-based wall clock. The
@@ -517,6 +569,7 @@ int main(int argc, char** argv) {
                           << " latency_drop=" << stats.latency_drops
                           << " concealed=" << concealed_packets
                           << " fec_recovered=" << fec_recovered.load()
+                          << " hard_resyncs=" << hard_resyncs.load()
                           << " max_arrival_gap_ms=" << std::fixed
                           << std::setprecision(1)
                           << static_cast<double>(max_arrival_gap_ns.load()) / 1'000'000.0

@@ -1,168 +1,238 @@
-# SoundMux Project Context
+# SoundMux Session Handoff
 
-This document is the handoff point for the next session.
+Last updated: September 18, 2026
 
-## Project goal
+## Product
 
-SoundMux is a cross-platform, peer-to-peer multi-device audio-routing system. The first implemented platform path is:
+SoundMux is intended to become a cross-platform, peer-to-peer-first audio-routing system for sending audio among phones and computers and playing it through a selected receiver device. The only active milestone is still:
 
 ```text
-iPhone ScreenCaptureKit audio -> PCM packets -> UDP/LAN -> Mac jitter buffer
--> CoreAudio output -> Mac speakers/headphones/AirPods
+iPhone ScreenCaptureKit system audio
+    -> packetization/FEC
+    -> UDP
+    -> Mac jitter buffer
+    -> CoreAudio default output
 ```
 
-Do not begin Windows, Linux, Android, multi-peer mixing, cloud services, or a large GUI until iPhone -> Mac is reliable on a private LAN.
+Do not start Windows, Linux, Android, multi-peer mixing, cloud networking, or a polished UI until this path is reliable.
 
-## Repository and remote
+## Repository
 
-- Local path: `/Users/skandavyas/multipoint`
-- GitHub: `https://github.com/skanda-vyas-srinivasan/multipoint`
-- Visibility: private
+- Local repository: `/Users/skandavyas/multipoint`
+- Remote: `https://github.com/skanda-vyas-srinivasan/stream-mux.git`
 - Branch: `main`
-- Initial commit: `72af87b` (`Initial iPhone to Mac audio streaming MVP`)
-- `main` tracks `origin/main`
+- Latest committed change: `feb6114 Route iOS UDP through Network framework`
+- Product name shown to users: **SoundMux**
+- Internal target/path/bundle names still use MultiAudio/multipoint for stability.
 
-Build products are ignored by `.gitignore`, including `build/`, Xcode `DerivedData/`, user data, and `.xcuserstate` files.
+Environment:
 
-## Environment used
-
-- macOS 27.0
-- Xcode 27.0
-- iPhone 13, iOS 27.0, Developer Mode enabled and physically paired
+- macOS 27.0, Xcode 27.0
+- iPhone 13 on iOS 27.0 with Developer Mode enabled
 - iPhone UDID: `00008110-000254980A51801E`
-- Apple development team: `7934D5M686`
-- iOS bundle ID: `com.skandavyas.multipoint.ios`
-- User-local CMake: `/Users/skandavyas/Library/Python/3.9/bin/cmake`
+- Team: `7934D5M686`
+- Bundle ID: `com.skandavyas.multipoint.ios`
+- CMake tools: `/Users/skandavyas/Library/Python/3.9/bin`
 
-## What is implemented
+## Implemented and physically proven
 
-### iOS capture
+- iOS 27 ScreenCaptureKit capture through Apple's system content-sharing picker.
+- Full-display capture with video frames discarded and audio `CMSampleBuffer`s processed.
+- Live sample format, frame count, timestamps, RMS, peak, capture-rate, and transport metrics.
+- 48 kHz stereo capture converted to the portable network format.
+- Protocol v3 with explicit 52-byte serialization; raw C++ structs are never sent.
+- PCM16 wire payload, 240 frames/5 ms per audio packet, 1,012-byte datagrams.
+- Systematic GF(256) 10-data + 5-parity FEC with parity delayed one group (~50 ms).
+- Portable C++20 packet, FEC, sequence, jitter, ring-buffer, clock, and UDP components.
+- Mac UDP receiver, jitter buffer, concealment, lock-free audio ring, and CoreAudio output.
+- Synthetic Mac 440 Hz path works.
+- Real iPhone audio has been heard through the Mac both on a LAN and through Tailscale.
 
-- Swift iOS app in `ios/MultiAudioIOS`.
-- Uses iOS 27 ScreenCaptureKit and `SCContentSharingPicker`.
-- User starts streaming, approves **Share Entire Screen**, and the app captures audio sample buffers.
-- Screen/video frames are discarded.
-- The app logs sample rate, channel count, format, frame count, presentation timestamp, duration, RMS, and peak without dumping PCM data.
-- A live UI indicates audio buffers and RMS/peak activity.
-- Physical iPhone testing proved that real system audio changes the RMS level.
-- The Apple `com.apple.developer.screen-recording` entitlement was rejected for this development team and was removed. Runtime capture works through the supported picker and usage description.
-- Instagram can produce silence at very low volume because the app appears to stop/mute its own renderer. Spotify continues rendering. This is an app/source behavior; supported iOS APIs cannot force another app to render muted audio.
+## Important transport change that worked
 
-### Portable C++20 core
+The old iOS portable BSD UDP socket could report successful sends while delivering **zero** packets through the iPhone's Tailscale VPN route. This was proven by adding raw UDP counters to the Mac receiver. At the same time:
 
-Located under `core/`:
+- Mac synthetic audio sent to `100.72.75.93:48100` played correctly.
+- Safari on the iPhone successfully reached an HTTP listener at `100.72.75.93:48101` from iPhone Tailscale IP `100.65.45.43`.
+- Therefore the Mac receiver and Tailscale path worked; the old iOS socket adapter did not use the route correctly.
 
-- Explicit network packet serialization/deserialization; no raw C++ structs on the wire.
-- Protocol v3 uses an explicit 52-byte header with magic, version, packet type, stream ID, sequence number, sender timestamp, audio sample index, audio format, payload size, and FEC shard metadata.
-- Capture/playback are float32; the wire format is 48 kHz stereo PCM16.
-- 240 frames per audio packet (5 ms), producing 1,012-byte datagrams.
-- Integer fields and PCM16 samples use network byte order.
-- A systematic 10-data + 5-parity erasure code over GF(256) is implemented. Unit tests prove byte-exact recovery of five simultaneously missing PCM packets.
-- POSIX UDP sender/receiver.
-- Jitter buffer supporting reorder detection, duplicates, late packets, missing packets, bounded capacity, stale-audio shedding, and gap resynchronization.
-- Lock-free single-producer/single-consumer audio ring buffer.
-- Monotonic clock and sequence utilities.
+Commit `feb6114` replaced only the iOS socket adapter with `Network.framework` `NWConnection` UDP. The portable packet/FEC logic remained unchanged. This build was physically installed and immediately restored iPhone-to-Mac audio.
 
-### macOS receiver and synthetic test
+In a controlled two-minute run after that change:
 
-Located under `macos/MultiAudioMac`:
+- About 36,000 raw UDP datagrams arrived.
+- About 24,000 were audio packets; the rest were parity.
+- Loss, late, duplicate, malformed, concealed, and CoreAudio-underrun counters stayed at zero.
+- No new latency drops occurred.
+- The stream sounded markedly better.
 
-- Synthetic 440 Hz sender and Mac UDP receiver.
-- Receiver pipeline: UDP receive thread -> jitter buffer -> audio ring -> CoreAudio default output AudioUnit.
-- CoreAudio callback does not perform network I/O, allocation, blocking mutex waits, or logging.
-- Synthetic Mac loopback was heard successfully with clean packet statistics.
-- macOS currently uses the selected system default output device.
+The test path used:
 
-### iPhone-to-Mac transport
+- Mac Tailscale IP: `100.72.75.93`
+- iPhone Tailscale IP: `100.65.45.43`
+- UDP port: `48100`
 
-- Objective-C++ bridge reuses the portable packet encoder.
-- Swift capture boundary converts supported linear PCM input to interleaved 48 kHz stereo float32.
-- Supports float32/int16 and interleaved/non-interleaved input forms.
-- Capture callback feeds a bounded queue; a separate UDP sender queue performs nonblocking socket transmission.
-- iOS 27 background execution only remained reliable when sends were triggered by ScreenCaptureKit deliveries. Independent 3.33 ms and 5 ms pacing timers were throttled after leaving the app, even though audio capture callbacks continued.
-- Parity is intentionally delayed by one FEC group (~50 ms) so a short radio blackout does not erase both source audio and its recovery data.
-- UI exposes receiver IP/port, network state, sent packets, queue drops, and conversion drops.
+## Long-run stall discovered
 
-## Build and test
+A later long-running test exposed occasional multi-second audible chopping. Receiver evidence showed this was not ordinary clock drift:
 
-From the repository root:
+- Maximum observed arrival freeze: about 36.2 seconds.
+- Hundreds of packet positions became missing after delivery resumed.
+- Concealment and bulk latency-drop counters rose sharply.
+- CoreAudio underruns stayed at zero because concealment kept feeding the callback.
+
+Observed behavior:
+
+```text
+delivery stalls
+    -> receiver conceals/rebuffers
+    -> stale queued packets resume in a burst
+    -> jitter depth becomes excessive
+    -> receiver repeatedly sheds old audio
+    -> several seconds of audible chopping
+```
+
+This is a correctness issue worth fixing before implementing the reverse direction. It is separate from later latency and clock-drift optimization.
+
+## Stall-recovery checkpoint
+
+The checkpoint includes changes in:
+
+- `ios/MultiAudioIOS/MultiAudioIOS/AudioTransport.swift`
+- `macos/MultiAudioMac/receiver_main.mm`
+
+Do not discard these changes.
+
+The iOS change:
+
+- Timestamps every queued UDP datagram.
+- Evicts the oldest queued datagram when the bounded queue is full, preserving live audio.
+- Drops queued datagrams older than 150 ms before transmission.
+- Counts those stale/evicted packets in the existing queue-drop metric.
+- Keeps at most one `NWConnection` send in flight, preventing a hidden multi-second framework backlog.
+
+The Mac change:
+
+- Detects a forward audio-sequence jump greater than 20 packets.
+- Clears stale jitter/FEC state on that discontinuity.
+- Requests a single hard playout resynchronization.
+- Discards the stale audio ring, clears concealment history, and waits for a fresh prebuffer.
+- Exposes a `hard_resyncs` receiver statistic.
+
+Both targets compile successfully and the portable test suite passes. The build
+was explicitly signed, installed with `devicectl`, and identified on the phone
+with a temporary `Stall recovery build` label.
+
+Physical testing proved that this recovery is incomplete. Actively opening and
+closing iPhone apps produced 5--10 seconds of badly chopped audio, and the
+receiver's sequence-gap detector did not engage (`hard_resyncs=0`). Do not
+describe this checkpoint as a completed fix.
+
+## September 18 synchronized capture diagnosis
+
+A controlled run captured the iPhone's existing `USBMetricLogger` output and a
+fresh Mac receiver timeline at the same time. Before phone interaction, capture
+callback gaps were about 22--37 ms, PTS error was effectively zero, send gaps
+were below 39 ms, and there were no queue drops or send failures.
+
+During app switching:
+
+- ScreenCaptureKit stopped delivering audio callbacks for 3.079 seconds.
+- The captured audio PTS skipped about 1.880 seconds.
+- iPhone UDP sending consequently paused for 3.237 seconds.
+- `NWConnection` remained `Ready`; there were no send failures.
+- The Mac observed the matching 3.389-second arrival freeze.
+- Recovery accumulated 77 concealed packets, 423 latency drops, 5 CoreAudio
+  underruns, and zero hard resyncs.
+
+This proves that the initiating discontinuity is already present at the iPhone
+ScreenCaptureKit audio boundary. The remaining difference between the callback
+gap and media PTS gap indicates that stale capture buffers are also delivered
+afterward, producing a catch-up burst. Receiver recovery then extends the
+audible damage beyond the original capture pause.
+
+An audio-output-only experiment removed the `.screen` stream output entirely.
+It compiled, installed, captured audio successfully, and reproduced the same
+interaction-triggered failure. This rules out SoundMux's discarded video
+callback and shared callback queue as the primary cause, although iOS still
+uses the full-display sharing session internally.
+
+The next fix should:
+
+1. Keep the ScreenCaptureKit callback minimal and move conversion, metering,
+   FEC, logging, and UI publication off that callback queue.
+2. Compare buffer PTS progress with monotonic host progress and discard stale
+   capture buffers delivered after a long callback stall.
+3. On a callback/PTS discontinuity over roughly 150--250 ms, clear pending
+   transport data, start a new stream ID, and force one receiver hard resync.
+4. Mute/rebuffer/fade in cleanly instead of replaying old audio.
+
+## Exact current runtime state
+
+- The user manually stopped the iPhone ScreenCaptureKit stream.
+- An updated Mac receiver was restarted with clean counters on UDP port `48100`
+  in exec session `78480`.
+- If that session does not survive handoff, restart it with:
+
+```sh
+./build/macos/MultiAudioMac/multipoint_receiver 48100 100
+```
+
+- The receiver binary includes raw UDP metrics and the hard-resync checkpoint.
+- The installed iPhone app includes the 150 ms stale-queue change, the visible
+  build marker, and the audio-output-only ScreenCaptureKit experiment.
+
+## Xcode/device tooling
+
+CoreDevice works when `xcrun devicectl` is run with sandbox escalation and the
+iPhone is connected, unlocked, and trusted over USB. Automatic provisioning
+also works with `xcodebuild -allowProvisioningUpdates`. Prefer explicit signed
+build and `devicectl device install app` commands over Xcode's Run UI.
+
+Xcode Stop/Run behavior was confusing during active ScreenCaptureKit sharing: the Mac continued receiving the same stream after the Xcode stop button and another Run action. Treat the system capture session as independently persistent for debugging purposes. Before replacement installation, confirm capture is stopped inside SoundMux; it is stopped now.
+
+The temporary `Stall recovery build` label is currently present in the UI and
+should be removed after this investigation.
+
+## Build and test commands
 
 ```sh
 /Users/skandavyas/Library/Python/3.9/bin/cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 /Users/skandavyas/Library/Python/3.9/bin/cmake --build build -j 8
 /Users/skandavyas/Library/Python/3.9/bin/ctest --test-dir build --output-on-failure
+
+xcodebuild \
+  -project ios/MultiAudioIOS/MultiAudioIOS.xcodeproj \
+  -scheme MultiAudioIOS \
+  -destination 'generic/platform=iOS' \
+  CODE_SIGNING_ALLOWED=NO build
 ```
 
-The core test suite currently passes. Tests cover packet round trips/rejection, sequence wrap, jitter reorder/loss/duplicates/recovery, the audio ring, and exact recovery of five missing FEC shards.
+The latest run of both builds and the core tests passed.
 
-The iOS app is built/deployed from Xcode to the physical iPhone using the configured development team. The Mac receiver can be launched from the build directory, for example:
+## Recommended next-session sequence
 
-```sh
-./build/macos/MultiAudioMac/multipoint_receiver 48100 40
-```
+1. Do not redo the network or synchronized capture diagnosis.
+2. Implement capture-boundary freshness detection and processing decoupling.
+3. Reset the sender stream epoch and receiver playout once per long capture
+   discontinuity.
+4. Rebuild, explicitly install with `devicectl`, and repeat the same app-switch
+   stress test with synchronized iPhone/Mac metrics.
+5. Success means the unavoidable capture pause becomes one clean mute/rebuffer
+   transition with no stale catch-up burst or multi-second chopping.
+6. Remove the temporary visible build identifier after validation.
+7. Only then proceed toward reverse Mac-to-iPhone and functional UI work.
 
-The second argument is target jitter latency in milliseconds. Recent LAN/FEC testing uses 100 ms.
+## Known limitations and later work
 
-## Tests completed and findings
+- Receiver-side buffering is currently much higher than the nominal 100 ms target; observed total receiver buffering was roughly 300 ms. Reliability comes first, then reduce latency.
+- Clock-drift estimation/adaptive resampling is not implemented.
+- Bonjour discovery is not implemented; manual IP is intentional.
+- No Opus, encryption/authentication, NAT traversal, TURN, or multi-peer mixing.
+- Tailscale is test plumbing, not the final product architecture.
+- A future no-router local mode should prefer peer-to-peer Wi-Fi; pure app-level BLE is unsuitable for the current PCM/FEC bitrate.
+- iOS public APIs cannot generally force another app to render nonzero audio while muting only the iPhone speaker.
 
-### Direct/private-LAN components
+## Interaction note for the next session
 
-- Packetization, UDP, jitter buffer, ring buffer, and CoreAudio were independently validated with the synthetic Mac sender.
-- The iPhone capture path was physically validated.
-
-### Public Wi-Fi and Tailscale relay
-
-The outdoor/public Wi-Fi used client isolation: the Mac and iPhone were both in `172.16.101.0/24`, but ARP from the Mac to the iPhone was incomplete and direct UDP failed.
-
-An iPhone Personal Hotspot test produced iOS error 50 (`network is down`) for the iPhone-to-tethered-Mac route. Do not treat that as proof that all hotspot configurations are impossible; it was the observed configuration.
-
-Tailscale was installed temporarily on both devices to create a test path. The Mac Tailscale IP was `100.72.75.93`; the iPhone was `100.65.45.43`. Tailscale reported a relay path (`sfo`/`lax`), not direct peer-to-peer.
-
-The complete iPhone -> Mac stream worked through the relay, but uncompressed float PCM was not consistently smooth. In a controlled roughly two-minute run:
-
-- 48,801 packets received
-- 2,028 packet positions missing during playout (~4%)
-- 404 late packets
-- 873 stale packets intentionally discarded during recovery
-- 0 buffer overflows
-- 0 CoreAudio underruns
-- 0 malformed, reordered, or duplicate packets
-
-The user heard occasional jitter and periods of silence, matching the measured relay outages. The sender UI showed network `Ready`, increasing packet count, and zero queue/conversion drops. Therefore those losses occurred after the iPhone sender, in the public network/relay path. The receiver recovered after outages instead of remaining permanently stuck.
-
-The current uncompressed format is about 3.2 Mbps and roughly 400 UDP packets/second. That is intentionally simple for the MVP but demanding for a relayed path.
-
-### Current LAN diagnosis (September 18, 2026)
-
-- Direct iPhone -> Mac streaming works at Mac address `10.0.0.14:48100`, including while another iPhone app is in the foreground.
-- ScreenCaptureKit continues delivering 48 kHz audio buffers in the background. The app declares `UIBackgroundModes = screen-capture`.
-- The iPhone's successful UDP writes were stable, with zero queue/conversion drops, while the Mac observed recurring loss bursts. macOS socket overflow counters did not increase. The loss therefore occurred between the successful iPhone socket write and Mac socket receipt.
-- Wi-Fi signal was strong, but ping also showed intermittent loss. The user cannot test another Wi-Fi network right now.
-- PCM16 reduced bandwidth from the earlier float32 wire format. A 100 ms receiver buffer, improved gap handling, and history-based concealment reduced but did not eliminate artifacts.
-- Pairwise XOR FEC was physically tested and was insufficient: in one run 17 packets were declared lost and only 6 were recovered. The user still heard bad artifacts.
-- Pairwise XOR was replaced with a systematic GF(256) 10+5 erasure code capable of recovering any five missing packets in a group. It compiles in CMake and Xcode, passes byte-exact recovery tests, and has now been validated on the physical iPhone/Mac path.
-- In the first physical GF(256) run, the user reported a stark improvement and heard few gaps. The sender sustained roughly 300 total audio/parity datagrams per second with zero queue drops or send failures, the Mac reported zero CoreAudio underruns, and the recovery counter increased during observed network loss.
-- Some bursts still exceeded or escaped the current recovery window, so the audio path is substantially improved but not yet artifact-free.
-- The previously installed delayed-XOR build proved that callback-triggered sending continues off-app. Do not restore independent high-frequency sender timers; iOS throttled them in the background and the queue overflowed.
-
-## Important current limitations
-
-- The definitive quality test still needs to be performed on a normal private/home Wi-Fi LAN, directly to the Mac's LAN IP, using a 40–50 ms target buffer.
-- Tailscale is test plumbing only; it is not part of the product design.
-- Bonjour/mDNS discovery is not implemented; manual Mac IP entry is intentional for this milestone.
-- No Opus compression, encryption/authentication, NAT traversal, TURN relay, clock-drift correction, adaptive resampling, or multi-peer mixing yet.
-- The receiver currently outputs to the macOS default output; explicit output-device selection is not implemented.
-- iOS local output is mirrored rather than suppressed. iOS public APIs do not provide a general system-wide virtual null sink or a way to make another app believe volume is nonzero while muting the iPhone speaker.
-- The current implementation is a prototype and should not claim production-grade relay reliability.
-
-## Next session: recommended order
-
-1. Repeat a controlled multi-minute GF(256) run and separate startup/app-switch loss from steady-state loss in the statistics.
-2. Track loss by FEC group so diagnostics distinguish recovered source loss, unrecoverable groups, and lost parity.
-3. If more than five data shards per group are missing, increase interleaving across groups or evaluate Opus; do not return to co-locating parity with its protected audio.
-4. Add clock-drift estimation and gradual adaptive resampling after burst recovery is stable.
-5. Add Bonjour discovery after manual-IP streaming is consistently reliable.
-
-## Current honest milestone
-
-SoundMux has proven supported iOS 27 ScreenCaptureKit system-audio capture, background capture delivery, UDP transport, GF(256) burst-loss recovery, and CoreAudio playback on a physical iPhone/Mac pair. The newest recovery design produced a clear audible improvement, but occasional artifacts remain. Do not call the transport production-reliable until steady-state unrecoverable loss is understood and controlled.
+The user is understandably frustrated by repeated setup questions and contradictory Xcode instructions. Lead with concrete actions and evidence. Do not ask them to repeat steps already documented here. Do not stop a working receiver unless its replacement is already ready and immediately restarted.

@@ -94,13 +94,9 @@ final class CaptureManager: NSObject, ObservableObject {
                 delegate: self
             )
 
-            // Full-display capture requires a screen output. Its buffers are
-            // intentionally ignored in stream(_:didOutputSampleBuffer:of:).
-            try newStream.addStreamOutput(
-                self,
-                type: .screen,
-                sampleHandlerQueue: sampleQueue
-            )
+            // SoundMux transports audio only. Do not attach a screen output:
+            // producing frames we immediately discard can contend with audio
+            // delivery during app switches and other display activity.
             try newStream.addStreamOutput(
                 self,
                 type: .audio,
@@ -181,10 +177,7 @@ extension CaptureManager: SCStreamOutput {
         didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
         of type: SCStreamOutputType
     ) {
-        guard type == .audio, CMSampleBufferIsValid(sampleBuffer) else {
-            // Video/screen frames are deliberately discarded.
-            return
-        }
+        guard type == .audio, CMSampleBufferIsValid(sampleBuffer) else { return }
 
         let metadata = AudioBufferMetadata(sampleBuffer: sampleBuffer)
         let transport = transportPipeline.consume(sampleBuffer)
