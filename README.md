@@ -26,7 +26,7 @@ CoreAudio.
 
 The portable C++20 core provides reusable sender and receiver engines around
 packet serialization, stream epochs, UDP adapters, jitter buffering, an audio
-ring buffer, hard resynchronization, and 10-data + 5-parity erasure coding.
+ring buffer, hard resynchronization, and 5-data + 5-parity erasure coding.
 Apple capture, networking policy, and playback integrations remain thin
 platform adapters outside the portable transport engines.
 

@@ -10,10 +10,10 @@
 namespace multipoint::protocol {
 
 inline constexpr std::uint32_t kMagic = 0x4d504155;  // "MPAU"
-inline constexpr std::uint8_t kProtocolVersion = 3;
+inline constexpr std::uint8_t kProtocolVersion = 4;
 inline constexpr std::uint8_t kAudioPacketType = 1;
 inline constexpr std::uint8_t kFecParityPacketType = 2;
-inline constexpr std::uint8_t kFecDataShards = 10;
+inline constexpr std::uint8_t kFecDataShards = 5;
 inline constexpr std::uint8_t kFecParityShards = 5;
 inline constexpr std::uint16_t kHeaderSize = 52;
 inline constexpr std::uint32_t kSampleRate = 48'000;

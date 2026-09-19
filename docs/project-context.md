@@ -40,9 +40,9 @@ Environment:
 - Full-display capture with video frames discarded and audio `CMSampleBuffer`s processed.
 - Live sample format, frame count, timestamps, RMS, peak, capture-rate, and transport metrics.
 - 48 kHz stereo capture converted to the portable network format.
-- Protocol v3 with explicit 52-byte serialization; raw C++ structs are never sent.
+- Protocol v4 with explicit 52-byte serialization; raw C++ structs are never sent.
 - PCM16 wire payload, 240 frames/5 ms per audio packet, 1,012-byte datagrams.
-- Systematic GF(256) 10-data + 5-parity FEC with parity delayed one group (~50 ms).
+- Systematic GF(256) 5-data + 5-parity FEC with parity delayed one group (~25 ms).
 - Portable C++20 packet, FEC, sequence, jitter, ring-buffer, clock, and UDP components.
 - Mac UDP receiver, jitter buffer, concealment, lock-free audio ring, and CoreAudio output.
 - Synthetic Mac 440 Hz path works.
@@ -182,7 +182,7 @@ platform capture adapter
 ```
 
 - `transport::SenderEngine` owns partial PCM, packet sequence/sample indexes,
-  stream epochs, and 10+5 delayed parity generation.
+  stream epochs, and 5+5 delayed parity generation.
 - `transport::ReceiverEngine` owns validation, retired-epoch rejection, FEC
   recovery, sequence-gap hard resync, jitter buffering, and receiver metrics.
 - The iOS app retains only the Apple capture/freshness adapter and
@@ -199,15 +199,23 @@ Tests now cover sender packetization/reset, receiver FEC recovery, receiver
 epoch transition, rejection of delayed packets from a retired epoch, and
 large sequence-gap resync. The core, Mac receiver, and signed physical-iPhone
 target all build successfully. The new app was installed on the iPhone on
-September 19. An app-switch audio stress test is still required before claiming
-the audible artifact is fixed; this refactor establishes the shared transport
-boundary but does not make ScreenCaptureKit callback stalls disappear.
+September 19. The shared transport boundary does not make ScreenCaptureKit
+callback stalls disappear.
 
 The first physical app-switch test after this refactor recorded a 633.9 ms
 capture callback gap and 420 ms PTS discontinuity. Capture resets and receiver
 hard resyncs both increased by two, proving the epoch transition worked, but
 the Mac saw a 5.674-second arrival gap and the iPhone discarded 378 capture
 buffers. The fixed three-second clean window was magnifying the source stall.
+
+Subsequent baseline testing isolated a separate receiver deadline bug. Parity
+was intentionally delayed one FEC group, but the receiver declared loss after
+only 30 ms. Protocol v4 shortens groups from 10+5 to 5+5 (25 ms parity delay),
+and the receiver now allows 60 ms for recovery inside its 100 ms jitter target.
+In the controlled physical-iPhone run this produced zero loss/concealment over
+4,051 audio packets while FEC recovered 11 packets through arrival gaps up to
+134.2 ms. Forced foreground-app switches still caused iOS source gaps and hard
+resyncs, but the stream returned to steady delivery afterward.
 
 The installed follow-up build replaces that fixed delay with a timeline-based
 gate. During recovery it compares cumulative PTS progress with monotonic host
