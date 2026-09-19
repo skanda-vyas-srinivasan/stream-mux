@@ -16,6 +16,7 @@
 		AA0000010000000000000207 /* USBMetricLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000001000000000000010B /* USBMetricLogger.swift */; };
 		AA0000010000000000000208 /* udp_socket_posix.cpp in Sources */ = {isa = PBXBuildFile; fileRef = AA000001000000000000010C /* udp_socket_posix.cpp */; };
 		AA0000010000000000000209 /* fec.cpp in Sources */ = {isa = PBXBuildFile; fileRef = AA000001000000000000010D /* fec.cpp */; };
+		AA000001000000000000020A /* sender_engine.cpp in Sources */ = {isa = PBXBuildFile; fileRef = AA000001000000000000010E /* sender_engine.cpp */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -32,6 +33,7 @@
 		AA000001000000000000010B /* USBMetricLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = USBMetricLogger.swift; sourceTree = "<group>"; };
 		AA000001000000000000010C /* udp_socket_posix.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = udp_socket_posix.cpp; path = ../../core/network/udp_socket_posix.cpp; sourceTree = SOURCE_ROOT; };
 		AA000001000000000000010D /* fec.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = fec.cpp; path = ../../core/protocol/fec.cpp; sourceTree = SOURCE_ROOT; };
+		AA000001000000000000010E /* sender_engine.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = sender_engine.cpp; path = ../../core/transport/sender_engine.cpp; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -74,6 +76,7 @@
 				AA0000010000000000000109 /* PacketEncoderBridge.h */,
 				AA000001000000000000010A /* audio_packet.cpp */,
 				AA000001000000000000010D /* fec.cpp */,
+				AA000001000000000000010E /* sender_engine.cpp */,
 				AA0000010000000000000104 /* Info.plist */,
 				AA0000010000000000000105 /* MultiAudioIOS.entitlements */,
 			);
@@ -157,6 +160,7 @@
 				AA0000010000000000000207 /* USBMetricLogger.swift in Sources */,
 				AA0000010000000000000208 /* udp_socket_posix.cpp in Sources */,
 				AA0000010000000000000209 /* fec.cpp in Sources */,
+				AA000001000000000000020A /* sender_engine.cpp in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

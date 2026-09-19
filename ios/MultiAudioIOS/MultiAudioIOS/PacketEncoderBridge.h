@@ -18,23 +18,19 @@ enum {
     MPAudioDatagramSize = 52 + MPAudioSamplesPerPacket * 2,
 };
 
-size_t MPAudioPacketEncode(
+typedef void* MPSenderEngineRef;
+
+MPSenderEngineRef MPSenderEngineCreate(uint64_t stream_id);
+bool MPSenderEngineReset(MPSenderEngineRef sender, uint64_t stream_id);
+bool MPSenderEnginePush(
+    MPSenderEngineRef sender,
     const float* interleaved_samples,
     size_t sample_count,
-    uint64_t stream_id,
-    uint32_t sequence,
     uint64_t sender_timestamp_ns,
-    uint64_t sample_index,
     uint8_t* output,
-    size_t output_capacity);
-
-size_t MPAudioFECParityEncode(
-    const uint8_t* data_datagrams,
-    size_t datagram_size,
-    size_t data_count,
-    uint8_t parity_index,
-    uint8_t* output,
-    size_t output_capacity);
+    size_t output_capacity,
+    size_t* datagram_count);
+void MPSenderEngineDestroy(MPSenderEngineRef sender);
 
 typedef void* MPUdpSenderRef;
 

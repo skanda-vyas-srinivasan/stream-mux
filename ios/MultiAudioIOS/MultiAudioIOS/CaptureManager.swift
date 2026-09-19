@@ -32,6 +32,9 @@ final class CaptureManager: NSObject, ObservableObject {
     @Published private(set) var packetRate = "—"
     @Published private(set) var maxQueueDepth = 0
     @Published private(set) var pacingUnderruns: UInt64 = 0
+    @Published private(set) var captureDiscontinuities: UInt64 = 0
+    @Published private(set) var staleCaptureDrops: UInt64 = 0
+    @Published private(set) var captureIngressDrops: UInt64 = 0
     @Published var errorMessage: String?
 
     private let picker = SCContentSharingPicker.shared
@@ -168,6 +171,9 @@ final class CaptureManager: NSObject, ObservableObject {
         packetRate = String(format: "%.1f packets/s", transport.packetRate)
         maxQueueDepth = transport.maxQueueDepth
         pacingUnderruns = transport.pacingUnderruns
+        captureDiscontinuities = transport.captureDiscontinuities
+        staleCaptureDrops = transport.staleCaptureDrops
+        captureIngressDrops = transport.captureIngressDrops
     }
 }
 
@@ -178,15 +184,17 @@ extension CaptureManager: SCStreamOutput {
         of type: SCStreamOutputType
     ) {
         guard type == .audio, CMSampleBufferIsValid(sampleBuffer) else { return }
-
-        let metadata = AudioBufferMetadata(sampleBuffer: sampleBuffer)
-        let transport = transportPipeline.consume(sampleBuffer)
+        let callbackTimestampNS = DispatchTime.now().uptimeNanoseconds
+        transportPipeline.submit(
+            sampleBuffer,
+            callbackTimestampNS: callbackTimestampNS
+        ) { [weak self] metadata, transport in
 #if DEBUG
-        USBMetricLogger.record(metadata: metadata, transport: transport)
+            USBMetricLogger.record(metadata: metadata, transport: transport)
 #endif
-
-        Task { @MainActor [weak self] in
-            self?.receivedAudio(metadata, transport: transport)
+            Task { @MainActor [weak self] in
+                self?.receivedAudio(metadata, transport: transport)
+            }
         }
     }
 }

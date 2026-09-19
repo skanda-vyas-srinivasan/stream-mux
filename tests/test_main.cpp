@@ -2,6 +2,8 @@
 #include "multipoint/jitter/jitter_buffer.h"
 #include "multipoint/protocol/audio_packet.h"
 #include "multipoint/protocol/fec.h"
+#include "multipoint/transport/receiver_engine.h"
+#include "multipoint/transport/sender_engine.h"
 #include "multipoint/util/sequence.h"
 
 #include <cmath>
@@ -87,6 +89,120 @@ void test_packet_round_trip() {
                          original.interleaved_samples[index]) <= 1.0F / 32'767.0F,
                 "PCM16 payload exceeded quantization tolerance");
     }
+}
+
+void test_sender_engine_packetization_and_epoch_reset() {
+    multipoint::transport::SenderEngine sender(9001);
+    std::vector<float> samples(
+        multipoint::protocol::kSamplesPerPacket * 20, 0.25F);
+    const auto datagrams = sender.push_audio(samples, 123'000);
+    require(datagrams.size() == 25, "sender emitted wrong audio/parity count");
+
+    std::size_t audio_count = 0;
+    std::size_t parity_count = 0;
+    for (const auto& datagram : datagrams) {
+        const auto decoded = multipoint::protocol::deserialize(datagram);
+        require(decoded.packet.has_value(), "sender emitted invalid datagram");
+        require(decoded.packet->header.stream_id == 9001, "sender stream ID wrong");
+        if (decoded.packet->header.packet_type ==
+            multipoint::protocol::kAudioPacketType) {
+            require(decoded.packet->header.sequence == audio_count,
+                    "sender audio sequence wrong");
+            ++audio_count;
+        } else {
+            require(decoded.packet->header.sequence == 0,
+                    "delayed parity protected wrong group");
+            ++parity_count;
+        }
+    }
+    require(audio_count == 20, "sender audio count wrong");
+    require(parity_count == 5, "sender parity count wrong");
+
+    sender.reset_stream(9002);
+    const auto after_reset = sender.push_audio(
+        std::span<const float>(samples.data(), multipoint::protocol::kSamplesPerPacket),
+        456'000);
+    require(after_reset.size() == 1, "sender retained FEC state across epoch");
+    const auto decoded = multipoint::protocol::deserialize(after_reset.front());
+    require(decoded.packet.has_value(), "reset sender emitted invalid packet");
+    require(decoded.packet->header.stream_id == 9002, "sender reset stream ID wrong");
+    require(decoded.packet->header.sequence == 0, "sender reset sequence wrong");
+    require(decoded.packet->header.sample_index == 0, "sender reset sample index wrong");
+}
+
+void test_receiver_engine_fec_and_epoch_rejection() {
+    multipoint::transport::SenderEngine sender(7001);
+    multipoint::transport::ReceiverEngine receiver({
+        .reorder_packets = 3,
+        .capacity_packets = 64,
+        .hard_resync_gap_packets = 20,
+        .maximum_fec_groups = 16,
+    });
+    std::vector<float> samples(
+        multipoint::protocol::kSamplesPerPacket * 20, 0.125F);
+    const auto old_epoch = sender.push_audio(samples, 1'000'000);
+
+    std::vector<std::byte> delayed_old_packet;
+    std::uint64_t arrival_ns = 2'000'000;
+    for (const auto& datagram : old_epoch) {
+        const auto decoded = multipoint::protocol::deserialize(datagram);
+        require(decoded.packet.has_value(), "receiver test source decode failed");
+        const auto& header = decoded.packet->header;
+        if (header.packet_type == multipoint::protocol::kAudioPacketType &&
+            header.sequence == 2) {
+            continue;
+        }
+        if (header.packet_type == multipoint::protocol::kAudioPacketType &&
+            header.sequence == 3) {
+            delayed_old_packet = datagram;
+        }
+        const auto ingest = receiver.ingest(datagram, arrival_ns);
+        require(ingest.error.empty(), "receiver rejected a valid test datagram");
+        arrival_ns += 1'000'000;
+    }
+
+    auto stats = receiver.snapshot();
+    require(stats.fec_recovered == 1, "receiver did not recover one missing shard");
+    for (std::uint32_t sequence = 0; sequence < 10; ++sequence) {
+        const auto popped = receiver.pop();
+        require(popped.packet && popped.packet->header.sequence == sequence,
+                "receiver FEC playout sequence was not contiguous");
+    }
+
+    sender.reset_stream(7002);
+    const auto new_epoch = sender.push_audio(
+        std::span<const float>(samples.data(), multipoint::protocol::kSamplesPerPacket),
+        3'000'000);
+    const auto transition = receiver.ingest(new_epoch.front(), arrival_ns);
+    require(transition.hard_resync, "new sender epoch did not hard resync receiver");
+    const auto before_stale = receiver.snapshot();
+    const auto stale = receiver.ingest(delayed_old_packet, arrival_ns + 1'000'000);
+    require(!stale.accepted && !stale.hard_resync,
+            "retired epoch packet was accepted or triggered resync");
+    const auto after_stale = receiver.snapshot();
+    require(after_stale.stale_stream_packets ==
+                before_stale.stale_stream_packets + 1,
+            "retired epoch packet was not counted");
+    require(after_stale.hard_resyncs == before_stale.hard_resyncs,
+            "retired epoch packet caused another hard resync");
+}
+
+void test_receiver_engine_sequence_gap_resync() {
+    multipoint::transport::ReceiverEngine receiver({
+        .reorder_packets = 3,
+        .capacity_packets = 64,
+        .hard_resync_gap_packets = 5,
+        .maximum_fec_groups = 16,
+    });
+    auto first = make_packet(0);
+    auto distant = make_packet(8);
+    distant.header.fec_shard_index = 8;
+    require(!receiver.ingest(multipoint::protocol::serialize(first), 1'000).hard_resync,
+            "first receiver packet unexpectedly resynced");
+    require(receiver.ingest(multipoint::protocol::serialize(distant), 2'000).hard_resync,
+            "large forward sequence gap did not hard resync");
+    require(receiver.snapshot().hard_resyncs == 1,
+            "sequence gap hard resync count wrong");
 }
 
 void test_packet_rejection() {
@@ -186,6 +302,9 @@ void test_jitter_latency_recovery() {
 int main() {
     try {
         test_packet_round_trip();
+        test_sender_engine_packetization_and_epoch_reset();
+        test_receiver_engine_fec_and_epoch_rejection();
+        test_receiver_engine_sequence_gap_resync();
         test_packet_rejection();
         test_fec_pair_recovery();
         test_sequence_wrap();

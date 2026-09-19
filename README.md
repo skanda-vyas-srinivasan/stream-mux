@@ -24,9 +24,11 @@ converts it to 48 kHz stereo PCM, and sends it over UDP. The Mac reconstructs
 recoverable packet loss, buffers network jitter, and plays the stream through
 CoreAudio.
 
-The portable C++20 core provides packet serialization, UDP transport, a jitter
-buffer, an audio ring buffer, and 10-data + 5-parity erasure coding. Apple
-capture and playback integrations remain outside the portable core.
+The portable C++20 core provides reusable sender and receiver engines around
+packet serialization, stream epochs, UDP adapters, jitter buffering, an audio
+ring buffer, hard resynchronization, and 10-data + 5-parity erasure coding.
+Apple capture, networking policy, and playback integrations remain thin
+platform adapters outside the portable transport engines.
 
 ## Build
 

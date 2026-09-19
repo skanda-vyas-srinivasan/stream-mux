@@ -1,9 +1,7 @@
 #include "multipoint/audio/spsc_audio_ring.h"
-#include "multipoint/jitter/jitter_buffer.h"
 #include "multipoint/network/udp_socket.h"
 #include "multipoint/protocol/audio_packet.h"
-#include "multipoint/protocol/fec.h"
-#include "multipoint/util/sequence.h"
+#include "multipoint/transport/receiver_engine.h"
 
 #include <AudioToolbox/AudioToolbox.h>
 
@@ -16,8 +14,6 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
-#include <map>
-#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -40,14 +36,6 @@ struct AudioState {
         kMaxRenderFrames * multipoint::protocol::kChannelCount,
         0.0F);
     std::atomic<bool> playout_active{false};
-};
-
-struct FecGroup {
-    std::optional<multipoint::protocol::AudioPacketHeader> base_header;
-    std::array<std::optional<std::vector<std::byte>>,
-               multipoint::protocol::kFecDataShards> data;
-    std::array<std::optional<std::vector<std::byte>>,
-               multipoint::protocol::kFecParityShards> parity;
 };
 
 OSStatus render_audio(
@@ -158,174 +146,43 @@ int main(int argc, char** argv) {
             8, std::max<std::size_t>(1, target_packets / 4));
 
         multipoint::network::UdpReceiver receiver(port);
-        multipoint::jitter::JitterBuffer jitter(reorder_packets, 512);
+        multipoint::transport::ReceiverEngine transport({
+            .reorder_packets = reorder_packets,
+            .capacity_packets = 512,
+            .hard_resync_gap_packets = kHardResyncGapPackets,
+            .maximum_fec_groups = 128,
+        });
         AudioState audio;
         DefaultOutput output(audio);
-        std::mutex jitter_mutex;
         std::atomic<bool> receive_running{true};
-        std::atomic<std::uint64_t> raw_datagrams{0};
-        std::atomic<std::uint64_t> raw_bytes{0};
-        std::atomic<std::uint64_t> malformed_packets{0};
-        std::atomic<std::uint64_t> fec_recovered{0};
-        std::atomic<std::uint64_t> max_arrival_gap_ns{0};
-        std::atomic<std::uint64_t> arrival_gap_events{0};
-        std::atomic<std::uint64_t> resync_generation{0};
-        std::atomic<std::uint64_t> hard_resyncs{0};
 
         std::thread receive_thread([&] {
             std::array<std::byte, 2'048> datagram{};
-            std::optional<std::chrono::steady_clock::time_point> last_arrival;
-            std::optional<std::uint64_t> current_stream;
-            std::optional<std::uint32_t> last_audio_sequence;
-            std::map<std::uint32_t, FecGroup> fec_groups;
             while (receive_running.load(std::memory_order_relaxed)) {
                 try {
                     const auto size = receiver.receive(datagram);
                     if (size == 0) continue;
-                    const auto datagram_number =
-                        raw_datagrams.fetch_add(1, std::memory_order_relaxed) + 1;
-                    raw_bytes.fetch_add(size, std::memory_order_relaxed);
-                    auto decoded = multipoint::protocol::deserialize(
-                        std::span<const std::byte>(datagram.data(), size));
-                    if (!decoded.packet) {
-                        const auto malformed =
-                            malformed_packets.fetch_add(1, std::memory_order_relaxed) + 1;
-                        if (malformed == 1 || malformed % 100 == 0) {
-                            std::cerr << "raw_udp=" << datagram_number
-                                      << " bytes=" << size
-                                      << " malformed=" << malformed
-                                      << " decode_error=\"" << decoded.error << "\"\n";
-                        }
-                        continue;
-                    }
-                    if (datagram_number == 1) {
+                    const auto arrival_ns = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count());
+                    const auto result = transport.ingest(
+                        std::span<const std::byte>(datagram.data(), size), arrival_ns);
+                    if (result.first_valid_datagram) {
                         std::cout << "First valid UDP audio datagram received ("
                                   << size << " bytes)\n";
                     }
-                    const auto arrival = std::chrono::steady_clock::now();
-                    if (last_arrival) {
-                        const auto gap = static_cast<std::uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                arrival - *last_arrival).count());
-                        auto previous = max_arrival_gap_ns.load(std::memory_order_relaxed);
-                        while (gap > previous &&
-                               !max_arrival_gap_ns.compare_exchange_weak(
-                                   previous, gap, std::memory_order_relaxed)) {}
-                        if (gap >= 10'000'000) {
-                            arrival_gap_events.fetch_add(1, std::memory_order_relaxed);
+                    if (!result.error.empty()) {
+                        const auto stats = transport.snapshot();
+                        if (stats.malformed_packets == 1 ||
+                            stats.malformed_packets % 100 == 0) {
+                            std::cerr << "raw_udp=" << stats.raw_datagrams
+                                      << " bytes=" << size
+                                      << " malformed=" << stats.malformed_packets
+                                      << " decode_error=\"" << result.error << "\"\n";
                         }
                     }
-                    last_arrival = arrival;
-
-                    auto packet = std::move(*decoded.packet);
-                    if (!current_stream || *current_stream != packet.header.stream_id) {
-                        const bool replacing_stream = current_stream.has_value();
-                        std::lock_guard lock(jitter_mutex);
-                        jitter.reset();
-                        fec_groups.clear();
-                        current_stream = packet.header.stream_id;
-                        last_audio_sequence.reset();
-                        if (replacing_stream) {
-                            hard_resyncs.fetch_add(1, std::memory_order_relaxed);
-                            resync_generation.fetch_add(1, std::memory_order_release);
-                        }
-                    }
-
-                    const bool is_audio = packet.header.packet_type ==
-                        multipoint::protocol::kAudioPacketType;
-                    const auto shard = packet.header.fec_shard_index;
-                    if ((is_audio && shard >= multipoint::protocol::kFecDataShards) ||
-                        (!is_audio &&
-                         (shard < multipoint::protocol::kFecDataShards ||
-                          shard >= multipoint::protocol::kFecDataShards +
-                              multipoint::protocol::kFecParityShards))) {
-                        malformed_packets.fetch_add(1, std::memory_order_relaxed);
-                        continue;
-                    }
-
-                    if (is_audio) {
-                        const auto sequence = packet.header.sequence;
-                        if (last_audio_sequence &&
-                            multipoint::util::sequence_after(
-                                sequence, *last_audio_sequence)) {
-                            const auto forward_gap = sequence - *last_audio_sequence;
-                            if (forward_gap > kHardResyncGapPackets) {
-                                {
-                                    std::lock_guard lock(jitter_mutex);
-                                    jitter.rebuffer();
-                                }
-                                fec_groups.clear();
-                                hard_resyncs.fetch_add(1, std::memory_order_relaxed);
-                                resync_generation.fetch_add(
-                                    1, std::memory_order_release);
-                                std::cerr << "Hard resync after sequence gap of "
-                                          << forward_gap << " packets\n";
-                            }
-                            last_audio_sequence = sequence;
-                        } else if (!last_audio_sequence) {
-                            last_audio_sequence = sequence;
-                        }
-                    }
-
-                    const auto group_base = is_audio
-                        ? packet.header.sequence - shard
-                        : packet.header.sequence;
-                    auto& group = fec_groups[group_base];
-                    if (!group.base_header) {
-                        auto header = packet.header;
-                        header.packet_type = multipoint::protocol::kAudioPacketType;
-                        header.sequence = group_base;
-                        if (is_audio) {
-                            header.sample_index -= static_cast<std::uint64_t>(shard) *
-                                multipoint::protocol::kFramesPerPacket;
-                        }
-                        header.fec_shard_index = 0;
-                        group.base_header = header;
-                    }
-
-                    if (is_audio) {
-                        if (!group.data[shard]) {
-                            group.data[shard] = packet.encoded_payload;
-                        }
-                        std::lock_guard lock(jitter_mutex);
-                        jitter.insert(std::move(packet));
-                    } else {
-                        const auto parity_index = static_cast<std::size_t>(
-                            shard - multipoint::protocol::kFecDataShards);
-                        if (!group.parity[parity_index]) {
-                            group.parity[parity_index] = std::move(packet.encoded_payload);
-                        }
-                    }
-
-                    const auto recovered_shards =
-                        multipoint::protocol::recover_fec_data(
-                            group.data, group.parity);
-                    if (recovered_shards) {
-                      for (auto recovered_shard : *recovered_shards) {
-                        const auto missing_index = recovered_shard.data_index;
-                        auto recovered_header = *group.base_header;
-                        recovered_header.sequence = group_base +
-                            static_cast<std::uint32_t>(missing_index);
-                        recovered_header.sample_index += missing_index *
-                            multipoint::protocol::kFramesPerPacket;
-                        recovered_header.fec_shard_index = static_cast<std::uint8_t>(
-                            missing_index);
-                        auto recovered = multipoint::protocol::decode_audio_payload(
-                            recovered_header, recovered_shard.payload);
-                        if (!recovered) continue;
-                        group.data[missing_index] =
-                            std::move(recovered_shard.payload);
-                        {
-                            std::lock_guard lock(jitter_mutex);
-                            if (jitter.insert(std::move(*recovered))) {
-                                fec_recovered.fetch_add(1, std::memory_order_relaxed);
-                            }
-                        }
-                      }
-                    }
-
-                    while (fec_groups.size() > 128) {
-                        fec_groups.erase(fec_groups.begin());
+                    if (result.hard_resync) {
+                        std::cerr << "Transport hard resync requested\n";
                     }
                 } catch (const std::exception& error) {
                     std::cerr << "network receive error: " << error.what() << '\n';
@@ -366,8 +223,9 @@ int main(int argc, char** argv) {
         std::uint64_t observed_resync_generation = 0;
 
         while (g_running) {
+            const auto transport_snapshot = transport.snapshot();
             const auto current_resync_generation =
-                resync_generation.load(std::memory_order_acquire);
+                transport_snapshot.resync_generation;
             if (current_resync_generation != observed_resync_generation) {
                 audio.playout_active.store(false, std::memory_order_release);
                 audio.ring.discard();
@@ -390,32 +248,30 @@ int main(int argc, char** argv) {
                 audio.ring.available_to_read() >= ring_target_frames) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             } else {
-            multipoint::jitter::PopResult result;
-            {
-                std::lock_guard lock(jitter_mutex);
-                // Keep a generous emergency ceiling. Normal clock drift must
-                // be corrected gradually; bulk-dropping at twice the target
-                // produced an audible discontinuity during short Wi-Fi stalls.
-                if (jitter.depth() > target_packets * 4) {
-                    jitter.discard_oldest_until(target_packets * 2);
-                }
-                result = jitter.pop(false);
-                if (result.status == multipoint::jitter::PopStatus::not_ready &&
-                    jitter.started()) {
-                    if (gap_grace_exhausted) {
-                        result = jitter.pop(true);
-                    } else {
-                        const auto now = std::chrono::steady_clock::now();
-                        if (!missing_since) missing_since = now;
-                        if (now - *missing_since >= reorder_grace) {
-                            gap_grace_exhausted = true;
-                            result = jitter.pop(true);
-                        }
+            // Keep a generous emergency ceiling. Normal clock drift must be
+            // corrected gradually; bulk-dropping at twice the target produced
+            // an audible discontinuity during short Wi-Fi stalls.
+            if (transport_snapshot.depth > target_packets * 4) {
+                const auto discarded =
+                    transport.discard_oldest_until(target_packets * 2);
+                (void)discarded;
+            }
+            auto result = transport.pop(false);
+            if (result.status == multipoint::jitter::PopStatus::not_ready &&
+                transport_snapshot.started) {
+                if (gap_grace_exhausted) {
+                    result = transport.pop(true);
+                } else {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (!missing_since) missing_since = now;
+                    if (now - *missing_since >= reorder_grace) {
+                        gap_grace_exhausted = true;
+                        result = transport.pop(true);
                     }
-                } else if (result.packet) {
-                    missing_since.reset();
-                    gap_grace_exhausted = false;
                 }
+            } else if (result.packet) {
+                missing_since.reset();
+                gap_grace_exhausted = false;
             }
             if (result.status == multipoint::jitter::PopStatus::not_ready) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -531,16 +387,12 @@ int main(int argc, char** argv) {
             }
 
             if (consecutive_missing >= reorder_packets) {
-                bool empty = false;
+                const bool empty = transport.snapshot().depth == 0;
                 bool advanced = false;
-                {
-                    std::lock_guard lock(jitter_mutex);
-                    empty = jitter.depth() == 0;
-                    if (empty) {
-                        jitter.rebuffer();
-                    } else {
-                        advanced = jitter.advance_to_oldest_available();
-                    }
+                if (empty) {
+                    transport.rebuffer();
+                } else {
+                    advanced = transport.advance_to_oldest_available();
                 }
                 if (empty) {
                     audio.playout_active.store(false, std::memory_order_release);
@@ -556,11 +408,11 @@ int main(int argc, char** argv) {
             }
             const auto stats_now = std::chrono::steady_clock::now();
             if (stats_now >= next_stats) {
-                std::lock_guard lock(jitter_mutex);
-                const auto& stats = jitter.stats();
+                const auto receiver_stats = transport.snapshot();
+                const auto& stats = receiver_stats.jitter;
                 std::cout << "received=" << stats.packets_received
-                          << " raw_udp=" << raw_datagrams.load()
-                          << " raw_bytes=" << raw_bytes.load()
+                          << " raw_udp=" << receiver_stats.raw_datagrams
+                          << " raw_bytes=" << receiver_stats.raw_bytes
                           << " lost=" << stats.packets_lost
                           << " reordered=" << stats.packets_reordered
                           << " late=" << stats.late_packets
@@ -568,16 +420,18 @@ int main(int argc, char** argv) {
                           << " overflow=" << stats.overflow_drops
                           << " latency_drop=" << stats.latency_drops
                           << " concealed=" << concealed_packets
-                          << " fec_recovered=" << fec_recovered.load()
-                          << " hard_resyncs=" << hard_resyncs.load()
+                          << " fec_recovered=" << receiver_stats.fec_recovered
+                          << " hard_resyncs=" << receiver_stats.hard_resyncs
                           << " max_arrival_gap_ms=" << std::fixed
                           << std::setprecision(1)
-                          << static_cast<double>(max_arrival_gap_ns.load()) / 1'000'000.0
-                          << " arrival_gap_events=" << arrival_gap_events.load()
-                          << " depth=" << jitter.depth()
+                          << static_cast<double>(receiver_stats.max_arrival_gap_ns) /
+                              1'000'000.0
+                          << " arrival_gap_events=" << receiver_stats.arrival_gap_events
+                          << " stale_stream=" << receiver_stats.stale_stream_packets
+                          << " depth=" << receiver_stats.depth
                           << " ring_frames=" << audio.ring.available_to_read()
                           << " underruns=" << audio.ring.underruns()
-                          << " malformed=" << malformed_packets.load() << '\n';
+                          << " malformed=" << receiver_stats.malformed_packets << '\n';
                 next_stats = stats_now + std::chrono::seconds(1);
             }
         }

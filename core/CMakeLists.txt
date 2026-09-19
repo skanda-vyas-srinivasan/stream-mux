@@ -3,6 +3,8 @@ add_library(multipoint_core STATIC
     protocol/fec.cpp
     jitter/jitter_buffer.cpp
     network/udp_socket_posix.cpp
+    transport/receiver_engine.cpp
+    transport/sender_engine.cpp
 )
 
 target_include_directories(multipoint_core PUBLIC include)

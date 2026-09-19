@@ -19,6 +19,18 @@ struct ContentView: View {
                     LabeledContent("Packet rate", value: capture.packetRate)
                     LabeledContent("Max send queue", value: capture.maxQueueDepth.formatted())
                     LabeledContent("Pacer underruns", value: capture.pacingUnderruns.formatted())
+                    LabeledContent(
+                        "Capture resets",
+                        value: capture.captureDiscontinuities.formatted()
+                    )
+                    LabeledContent(
+                        "Stale capture drops",
+                        value: capture.staleCaptureDrops.formatted()
+                    )
+                    LabeledContent(
+                        "Capture queue drops",
+                        value: capture.captureIngressDrops.formatted()
+                    )
                 }
 
                 Section("Capture") {
@@ -61,12 +73,6 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("SoundMux")
-            .safeAreaInset(edge: .bottom) {
-                Text("Stall recovery build")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.vertical, 4)
-            }
         }
     }
 }

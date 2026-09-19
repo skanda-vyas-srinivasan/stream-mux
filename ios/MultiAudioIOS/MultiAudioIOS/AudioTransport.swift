@@ -19,11 +19,37 @@ struct TransportSnapshot: Sendable {
     let sendFailures: UInt64
     let maxSendGapMS: Double
     let sendGapEvents: UInt64
+    let captureDiscontinuities: UInt64
+    let staleCaptureDrops: UInt64
+    let captureIngressDrops: UInt64
 }
 
 final class AudioTransportPipeline: @unchecked Sendable {
+    private final class QueuedCapture: @unchecked Sendable {
+        let sampleBuffer: CMSampleBuffer
+        let callbackTimestampNS: UInt64
+        let completion: @Sendable (AudioBufferMetadata, TransportSnapshot) -> Void
+
+        init(
+            sampleBuffer: CMSampleBuffer,
+            callbackTimestampNS: UInt64,
+            completion: @escaping @Sendable (AudioBufferMetadata, TransportSnapshot) -> Void
+        ) {
+            self.sampleBuffer = sampleBuffer
+            self.callbackTimestampNS = callbackTimestampNS
+            self.completion = completion
+        }
+    }
+
     private let sender = UDPAudioSender(capacity: 256)
     private var packetizer = AudioPacketizer()
+    private let processingQueue = DispatchQueue(
+        label: "com.skandavyas.multipoint.audio-processing",
+        qos: .userInteractive
+    )
+    private let ingressLock = NSLock()
+    private var queuedCaptures: [QueuedCapture] = []
+    private var processingScheduled = false
     private let statsLock = NSLock()
     private var conversionDrops: UInt64 = 0
     private var totalFrames: UInt64 = 0
@@ -34,58 +60,207 @@ final class AudioTransportPipeline: @unchecked Sendable {
     private var lastPTSEndSeconds: Double?
     private var maxCallbackGapNS: UInt64 = 0
     private var maxPTSErrorSeconds: Double = 0
+    private var minimumCaptureOffsetSeconds: Double?
+    private var recoveringFromDiscontinuity = false
+    private var freshCaptureSinceNS: UInt64?
+    private var captureDiscontinuities: UInt64 = 0
+    private var staleCaptureDrops: UInt64 = 0
+    private var captureIngressDrops: UInt64 = 0
+
+    // Short gaps belong to normal jitter/FEC recovery. Longer capture gaps
+    // mean ScreenCaptureKit has stopped delivering real-time audio.
+    private static let discontinuityThresholdNS: UInt64 = 250_000_000
+    private static let maximumCaptureAgeSeconds = 0.150
+    private static let recoveryStablePeriodNS: UInt64 = 3_000_000_000
+    private static let maximumQueuedCaptures = 8
 
     func start(host: String, port: UInt16) {
-        packetizer.reset()
-        statsLock.withLock {
-            conversionDrops = 0
-            totalFrames = 0
-            firstFrameCount = 0
-            firstHostTimeNS = nil
-            lastHostTimeNS = nil
-            firstPTSSeconds = nil
-            lastPTSEndSeconds = nil
-            maxCallbackGapNS = 0
-            maxPTSErrorSeconds = 0
+        processingQueue.sync {
+            ingressLock.withLock {
+                queuedCaptures.removeAll(keepingCapacity: true)
+                processingScheduled = false
+            }
+            packetizer.reset()
+            statsLock.withLock {
+                conversionDrops = 0
+                totalFrames = 0
+                firstFrameCount = 0
+                firstHostTimeNS = nil
+                lastHostTimeNS = nil
+                firstPTSSeconds = nil
+                lastPTSEndSeconds = nil
+                maxCallbackGapNS = 0
+                maxPTSErrorSeconds = 0
+                minimumCaptureOffsetSeconds = nil
+                recoveringFromDiscontinuity = false
+                freshCaptureSinceNS = nil
+                captureDiscontinuities = 0
+                staleCaptureDrops = 0
+                captureIngressDrops = 0
+            }
+            sender.start(host: host, port: port)
         }
-        sender.start(host: host, port: port)
     }
 
     func stop() {
-        sender.stop()
-        packetizer.reset()
+        ingressLock.withLock {
+            queuedCaptures.removeAll(keepingCapacity: true)
+        }
+        processingQueue.sync {
+            sender.stop()
+            packetizer.reset()
+        }
     }
 
-    // Called only from CaptureManager's serial sample queue.
-    func consume(_ sampleBuffer: CMSampleBuffer) -> TransportSnapshot {
-        guard let samples = PCMExtractor.interleavedFloatStereo48k(from: sampleBuffer) else {
-            statsLock.withLock { conversionDrops &+= 1 }
-            return snapshot()
+    // The ScreenCaptureKit callback retains and enqueues the buffer, then
+    // returns. Conversion, metering, FEC, and network queueing happen only on
+    // processingQueue so capture delivery never waits for transport work.
+    func submit(
+        _ sampleBuffer: CMSampleBuffer,
+        callbackTimestampNS: UInt64,
+        completion: @escaping @Sendable (AudioBufferMetadata, TransportSnapshot) -> Void
+    ) {
+        let capture = QueuedCapture(
+            sampleBuffer: sampleBuffer,
+            callbackTimestampNS: callbackTimestampNS,
+            completion: completion
+        )
+        var droppedCapture = false
+        let shouldSchedule = ingressLock.withLock {
+            if queuedCaptures.count == Self.maximumQueuedCaptures {
+                queuedCaptures.removeFirst()
+                droppedCapture = true
+            }
+            queuedCaptures.append(capture)
+            if processingScheduled { return false }
+            processingScheduled = true
+            return true
         }
+        if droppedCapture {
+            statsLock.withLock { captureIngressDrops &+= 1 }
+        }
+        if shouldSchedule {
+            processingQueue.async { [weak self] in self?.drainCaptures() }
+        }
+    }
 
-        let timestamp = DispatchTime.now().uptimeNanoseconds
-        let frameCount = UInt64(samples.count / Int(MPAudioChannelCount))
+    private func drainCaptures() {
+        while let capture = ingressLock.withLock({ () -> QueuedCapture? in
+            guard !queuedCaptures.isEmpty else {
+                processingScheduled = false
+                return nil
+            }
+            return queuedCaptures.removeFirst()
+        }) {
+            let metadata = AudioBufferMetadata(sampleBuffer: capture.sampleBuffer)
+            let transport = consume(
+                capture.sampleBuffer,
+                callbackTimestampNS: capture.callbackTimestampNS
+            )
+            capture.completion(metadata, transport)
+        }
+    }
+
+    private func consume(
+        _ sampleBuffer: CMSampleBuffer,
+        callbackTimestampNS timestamp: UInt64
+    ) -> TransportSnapshot {
         let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         let duration = CMTimeGetSeconds(CMSampleBufferGetDuration(sampleBuffer))
+        let frameCount = UInt64(CMSampleBufferGetNumSamples(sampleBuffer))
+        var discardTransport = false
+        var resumeWithNewStream = false
+        var dropAsStale = false
         statsLock.withLock {
+            var callbackDiscontinuity = false
             if firstHostTimeNS == nil {
                 firstHostTimeNS = timestamp
                 firstFrameCount = frameCount
             }
             if let lastHostTimeNS {
-                maxCallbackGapNS = max(maxCallbackGapNS, timestamp - lastHostTimeNS)
+                let callbackGap = timestamp - lastHostTimeNS
+                maxCallbackGapNS = max(maxCallbackGapNS, callbackGap)
+                callbackDiscontinuity = callbackGap > Self.discontinuityThresholdNS
             }
             if firstPTSSeconds == nil, pts.isFinite {
                 firstPTSSeconds = pts
             }
+            var ptsDiscontinuity = false
             if let expectedPTS = lastPTSEndSeconds, pts.isFinite {
-                maxPTSErrorSeconds = max(maxPTSErrorSeconds, abs(pts - expectedPTS))
+                let ptsError = abs(pts - expectedPTS)
+                maxPTSErrorSeconds = max(maxPTSErrorSeconds, ptsError)
+                ptsDiscontinuity = ptsError > Self.maximumCaptureAgeSeconds
             }
+
+            var captureAgeSeconds = 0.0
+            var captureOffsetSeconds: Double?
+            if pts.isFinite {
+                let hostSeconds = Double(timestamp) / 1_000_000_000
+                let offset = hostSeconds - pts
+                captureOffsetSeconds = offset
+                if let minimumCaptureOffsetSeconds {
+                    if offset < minimumCaptureOffsetSeconds {
+                        self.minimumCaptureOffsetSeconds = offset
+                    }
+                    captureAgeSeconds = max(0, offset - minimumCaptureOffsetSeconds)
+                } else {
+                    minimumCaptureOffsetSeconds = offset
+                }
+            }
+
+            let captureIsUnstable = callbackDiscontinuity || ptsDiscontinuity ||
+                captureAgeSeconds > Self.maximumCaptureAgeSeconds
+            if captureIsUnstable && !recoveringFromDiscontinuity {
+                recoveringFromDiscontinuity = true
+                freshCaptureSinceNS = nil
+                captureDiscontinuities &+= 1
+                discardTransport = true
+                // ScreenCaptureKit may permanently omit media time during the
+                // stall. Rebase this epoch so a live-but-shifted PTS timeline
+                // can pass the clean-window check instead of staying stale
+                // forever relative to the previous epoch.
+                minimumCaptureOffsetSeconds = captureOffsetSeconds
+            }
+            if recoveringFromDiscontinuity {
+                if captureIsUnstable {
+                    freshCaptureSinceNS = nil
+                } else {
+                    if freshCaptureSinceNS == nil {
+                        freshCaptureSinceNS = timestamp
+                    }
+                    if let freshCaptureSinceNS,
+                       timestamp - freshCaptureSinceNS >=
+                           Self.recoveryStablePeriodNS {
+                        recoveringFromDiscontinuity = false
+                        self.freshCaptureSinceNS = nil
+                        resumeWithNewStream = true
+                    }
+                }
+                if recoveringFromDiscontinuity {
+                    staleCaptureDrops &+= 1
+                    dropAsStale = true
+                }
+            }
+
             if pts.isFinite, duration.isFinite {
                 lastPTSEndSeconds = pts + duration
             }
             totalFrames &+= frameCount
             lastHostTimeNS = timestamp
+        }
+
+        if discardTransport {
+            sender.discardQueued()
+        }
+        if resumeWithNewStream {
+            sender.discardQueued()
+            packetizer.reset()
+        }
+        if dropAsStale { return snapshot() }
+
+        guard let samples = PCMExtractor.interleavedFloatStereo48k(from: sampleBuffer) else {
+            statsLock.withLock { conversionDrops &+= 1 }
+            return snapshot()
         }
         for datagram in packetizer.consume(samples, senderTimestampNS: timestamp) {
             sender.enqueue(datagram)
@@ -128,7 +303,10 @@ final class AudioTransportPipeline: @unchecked Sendable {
                 network.pacingUnderruns,
                 network.sendFailures,
                 network.maxSendGapMS,
-                network.sendGapEvents
+                network.sendGapEvents,
+                captureDiscontinuities,
+                staleCaptureDrops,
+                captureIngressDrops
             )
         }
         return TransportSnapshot(
@@ -146,99 +324,68 @@ final class AudioTransportPipeline: @unchecked Sendable {
             pacingUnderruns: diagnostics.8,
             sendFailures: diagnostics.9,
             maxSendGapMS: diagnostics.10,
-            sendGapEvents: diagnostics.11
+            sendGapEvents: diagnostics.11,
+            captureDiscontinuities: diagnostics.12,
+            staleCaptureDrops: diagnostics.13,
+            captureIngressDrops: diagnostics.14
         )
     }
 }
 
-private struct AudioPacketizer {
-    private var pending: [Float] = []
-    private var fecGroup: [Data] = []
-    private var delayedParity: [Data] = []
-    private var sequence: UInt32 = 0
-    private var sampleIndex: UInt64 = 0
-    private var streamID: UInt64 = UInt64.random(in: 1...UInt64.max)
+private final class AudioPacketizer {
+    private var engine: MPSenderEngineRef?
 
-    mutating func reset() {
-        pending.removeAll(keepingCapacity: true)
-        fecGroup.removeAll(keepingCapacity: true)
-        delayedParity.removeAll(keepingCapacity: true)
-        sequence = 0
-        sampleIndex = 0
-        streamID = UInt64.random(in: 1...UInt64.max)
+    init() {
+        engine = MPSenderEngineCreate(UInt64.random(in: 1...UInt64.max))
     }
 
-    mutating func consume(
+    deinit {
+        MPSenderEngineDestroy(engine)
+    }
+
+    func reset() {
+        guard let engine else { return }
+        _ = MPSenderEngineReset(
+            engine,
+            UInt64.random(in: 1...UInt64.max)
+        )
+    }
+
+    func consume(
         _ samples: [Float],
         senderTimestampNS: UInt64
     ) -> [Data] {
-        pending.append(contentsOf: samples)
-        // Bound capture-side memory to two seconds. A full network queue is
-        // handled separately and never blocks the capture callback.
-        let maximumSamples = 48_000 * Int(MPAudioChannelCount) * 2
-        if pending.count > maximumSamples {
-            pending.removeFirst(pending.count - maximumSamples)
-        }
-
+        guard let engine, !samples.isEmpty else { return [] }
         let packetSamples = Int(MPAudioSamplesPerPacket)
-        var datagrams: [Data] = []
-        while pending.count >= packetSamples {
-            var datagram = Data(count: Int(MPAudioDatagramSize))
-            let encodedSize: Int = pending.withUnsafeBufferPointer { samplesBuffer in
-                datagram.withUnsafeMutableBytes { outputBuffer in
-                    MPAudioPacketEncode(
-                        samplesBuffer.baseAddress,
-                        packetSamples,
-                        streamID,
-                        sequence,
-                        senderTimestampNS,
-                        sampleIndex,
-                        outputBuffer.bindMemory(to: UInt8.self).baseAddress,
-                        outputBuffer.count
-                    )
-                }
-            }
-            guard encodedSize == Int(MPAudioDatagramSize) else { break }
-            datagrams.append(datagram)
-            fecGroup.append(datagram)
-            pending.removeFirst(packetSamples)
-            sequence &+= 1
-            sampleIndex &+= UInt64(MPAudioFramesPerPacket)
-
-            if fecGroup.count == Int(MPAudioFECDataShards) {
-                var newParity: [Data] = []
-                newParity.reserveCapacity(Int(MPAudioFECParityShards))
-                var contiguousGroup = Data()
-                contiguousGroup.reserveCapacity(
-                    fecGroup.count * Int(MPAudioDatagramSize)
+        // The C++ engine may begin with one partial packet and may release five
+        // delayed parity datagrams whenever a ten-packet FEC group completes.
+        let maximumAudioPackets = samples.count / packetSamples + 2
+        let maximumParityPackets =
+            ((maximumAudioPackets + Int(MPAudioFECDataShards) - 1) /
+                Int(MPAudioFECDataShards)) * Int(MPAudioFECParityShards)
+        let capacity = maximumAudioPackets + maximumParityPackets
+        var output = Data(count: capacity * Int(MPAudioDatagramSize))
+        var datagramCount = 0
+        let encoded = samples.withUnsafeBufferPointer { samplesBuffer in
+            output.withUnsafeMutableBytes { outputBuffer in
+                MPSenderEnginePush(
+                    engine,
+                    samplesBuffer.baseAddress,
+                    samples.count,
+                    senderTimestampNS,
+                    outputBuffer.bindMemory(to: UInt8.self).baseAddress,
+                    outputBuffer.count,
+                    &datagramCount
                 )
-                for packet in fecGroup { contiguousGroup.append(packet) }
-                for parityIndex in 0..<Int(MPAudioFECParityShards) {
-                    var parity = Data(count: Int(MPAudioDatagramSize))
-                    let paritySize = contiguousGroup.withUnsafeBytes { groupBytes in
-                        parity.withUnsafeMutableBytes { outputBytes in
-                            MPAudioFECParityEncode(
-                                groupBytes.bindMemory(to: UInt8.self).baseAddress,
-                                Int(MPAudioDatagramSize),
-                                Int(MPAudioFECDataShards),
-                                UInt8(parityIndex),
-                                outputBytes.bindMemory(to: UInt8.self).baseAddress,
-                                outputBytes.count
-                            )
-                        }
-                    }
-                    if paritySize == Int(MPAudioDatagramSize) {
-                        newParity.append(parity)
-                    }
-                }
-                // Keep parity temporally separated from the audio it protects.
-                // A short radio blackout should not erase both copies.
-                datagrams.append(contentsOf: delayedParity)
-                delayedParity = newParity
-                fecGroup.removeAll(keepingCapacity: true)
             }
         }
-        return datagrams
+        guard encoded else { return [] }
+
+        let datagramSize = Int(MPAudioDatagramSize)
+        return (0..<datagramCount).map { index in
+            let start = index * datagramSize
+            return output.subdata(in: start..<(start + datagramSize))
+        }
     }
 }
 
@@ -365,6 +512,16 @@ private final class UDPAudioSender: @unchecked Sendable {
         }
         if shouldSchedule {
             queue.async { [weak self] in self?.drainAvailablePackets() }
+        }
+    }
+
+    func discardQueued() {
+        lock.withLock {
+            queueDrops &+= UInt64(count)
+            for index in slots.indices { slots[index] = nil }
+            head = 0
+            tail = 0
+            count = 0
         }
     }
 

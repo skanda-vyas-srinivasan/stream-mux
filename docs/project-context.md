@@ -1,6 +1,6 @@
 # SoundMux Session Handoff
 
-Last updated: September 18, 2026
+Last updated: September 19, 2026
 
 ## Product
 
@@ -21,7 +21,7 @@ Do not start Windows, Linux, Android, multi-peer mixing, cloud networking, or a 
 - Local repository: `/Users/skandavyas/multipoint`
 - Remote: `https://github.com/skanda-vyas-srinivasan/stream-mux.git`
 - Branch: `main`
-- Latest committed change: `feb6114 Route iOS UDP through Network framework`
+- Previous diagnostic checkpoint: `c7a428c Checkpoint capture stall diagnosis and recovery work`
 - Product name shown to users: **SoundMux**
 - Internal target/path/bundle names still use MultiAudio/multipoint for stability.
 
@@ -167,20 +167,60 @@ The next fix should:
    transport data, start a new stream ID, and force one receiver hard resync.
 4. Mute/rebuffer/fade in cleanly instead of replaying old audio.
 
+## September 19 portable transport refactor
+
+The sender and receiver transport orchestration now lives in the portable C++
+core rather than being reimplemented by each app:
+
+```text
+platform capture adapter
+    -> normalized timestamped PCM
+    -> C++ SenderEngine (packetization, epochs, delayed FEC)
+    -> platform datagram adapter
+    -> C++ ReceiverEngine (decode, epochs, FEC, jitter, resync)
+    -> platform playback adapter
+```
+
+- `transport::SenderEngine` owns partial PCM, packet sequence/sample indexes,
+  stream epochs, and 10+5 delayed parity generation.
+- `transport::ReceiverEngine` owns validation, retired-epoch rejection, FEC
+  recovery, sequence-gap hard resync, jitter buffering, and receiver metrics.
+- The iOS app retains only the Apple capture/freshness adapter and
+  `Network.framework` UDP queue; its Swift packet/FEC implementation was
+  removed and replaced with a small C bridge to `SenderEngine`.
+- The Mac app retains POSIX UDP, concealment/ring management, and CoreAudio;
+  its duplicated decode/FEC/jitter/epoch implementation was replaced by
+  `ReceiverEngine`.
+- These engines are platform-neutral C++20 and are intended to be reused for
+  Mac, Windows, and Android adapters. Platform networking and audio I/O remain
+  separate by design.
+
+Tests now cover sender packetization/reset, receiver FEC recovery, receiver
+epoch transition, rejection of delayed packets from a retired epoch, and
+large sequence-gap resync. The core, Mac receiver, and signed physical-iPhone
+target all build successfully. The new app was installed on the iPhone on
+September 19. An app-switch audio stress test is still required before claiming
+the audible artifact is fixed; this refactor establishes the shared transport
+boundary but does not make ScreenCaptureKit callback stalls disappear.
+
 ## Exact current runtime state
 
-- The user manually stopped the iPhone ScreenCaptureKit stream.
-- An updated Mac receiver was restarted with clean counters on UDP port `48100`
-  in exec session `78480`.
-- If that session does not survive handoff, restart it with:
+- The iPhone 13 was visible through CoreDevice over USB as connected at the
+  last check (UDID `00008110-000254980A51801E`).
+- The signed Debug app containing the portable sender engine was installed.
+- Automated launch was denied only because the iPhone was locked; unlock it
+  before the next launch/test.
+- No Mac receiver process should be assumed to be running. Start it with:
 
 ```sh
 ./build/macos/MultiAudioMac/multipoint_receiver 48100 100
 ```
 
-- The receiver binary includes raw UDP metrics and the hard-resync checkpoint.
-- The installed iPhone app includes the 150 ms stale-queue change, the visible
-  build marker, and the audio-output-only ScreenCaptureKit experiment.
+- The receiver binary now uses the portable `ReceiverEngine` and includes raw
+  UDP, FEC, stale-epoch, arrival-gap, jitter, and hard-resync metrics.
+- The installed iPhone app includes callback decoupling, capture freshness
+  quarantine, new stream epochs after recovery, and the portable
+  `SenderEngine`.
 
 ## Xcode/device tooling
 
@@ -213,15 +253,15 @@ The latest run of both builds and the core tests passed.
 ## Recommended next-session sequence
 
 1. Do not redo the network or synchronized capture diagnosis.
-2. Implement capture-boundary freshness detection and processing decoupling.
-3. Reset the sender stream epoch and receiver playout once per long capture
-   discontinuity.
-4. Rebuild, explicitly install with `devicectl`, and repeat the same app-switch
-   stress test with synchronized iPhone/Mac metrics.
-5. Success means the unavoidable capture pause becomes one clean mute/rebuffer
+2. Unlock the already-connected iPhone and launch the installed build.
+3. Start the Mac receiver with clean counters and begin ScreenCaptureKit audio.
+4. Repeat the app-switch stress test with synchronized iPhone/Mac metrics.
+5. When the user says `now`, take a baseline immediately, continue collecting
+   for exactly 10 seconds, then analyze that delta. Do not stop capture at the
+   marker.
+6. Success means the unavoidable capture pause becomes one clean mute/rebuffer
    transition with no stale catch-up burst or multi-second chopping.
-6. Remove the temporary visible build identifier after validation.
-7. Only then proceed toward reverse Mac-to-iPhone and functional UI work.
+7. Do not claim the artifact is fixed until the user confirms what they heard.
 
 ## Known limitations and later work
 
