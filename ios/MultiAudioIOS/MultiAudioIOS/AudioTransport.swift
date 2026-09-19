@@ -1,6 +1,7 @@
 import AudioToolbox
 import CoreMedia
 import Foundation
+import Network
 
 struct TransportSnapshot: Sendable {
     let packetsSent: UInt64
@@ -257,9 +258,8 @@ private final class UDPAudioSender: @unchecked Sendable {
     private var maxSendGapNS: UInt64 = 0
     private var sendGapEvents: UInt64 = 0
     private var drainScheduled = false
-    private var retryDatagram: Data?
     private var state = "Stopped"
-    private var socket: MPUdpSenderRef?
+    private var connection: NWConnection?
 
     init(capacity: Int) {
         slots = Array(repeating: nil, count: capacity)
@@ -281,27 +281,57 @@ private final class UDPAudioSender: @unchecked Sendable {
             maxSendGapNS = 0
             sendGapEvents = 0
             drainScheduled = false
-            retryDatagram = nil
             state = "Starting"
         }
 
-        socket = host.withCString { MPUdpSenderCreate($0, port) }
-        guard socket != nil else {
-            lock.withLock { state = "Failed: UDP socket" }
+        let endpointHost = NWEndpoint.Host(host)
+        guard let endpointPort = NWEndpoint.Port(rawValue: port) else {
+            lock.withLock { state = "Failed: invalid UDP port" }
             return
         }
-        lock.withLock { state = "Ready" }
-
+        let newConnection = NWConnection(
+            host: endpointHost,
+            port: endpointPort,
+            using: .udp
+        )
+        newConnection.stateUpdateHandler = { [weak self, weak newConnection] newState in
+            guard let self, let newConnection,
+                  self.connection === newConnection else { return }
+            self.lock.withLock {
+                switch newState {
+                case .setup:
+                    self.state = "Starting"
+                case .preparing:
+                    self.state = "Preparing route"
+                case .ready:
+                    self.state = "Ready"
+                case .waiting(let error):
+                    self.state = "Waiting: \(error)"
+                case .failed(let error):
+                    self.state = "Failed: \(error)"
+                case .cancelled:
+                    self.state = "Stopped"
+                @unknown default:
+                    self.state = "Unknown network state"
+                }
+            }
+        }
+        queue.sync {
+            connection = newConnection
+            newConnection.start(queue: queue)
+        }
     }
 
     func stop() {
         queue.sync {
-            if let socket {
-                MPUdpSenderDestroy(socket)
-                self.socket = nil
-            }
+            connection?.stateUpdateHandler = nil
+            connection?.cancel()
+            connection = nil
         }
-        lock.withLock { state = "Stopped" }
+        lock.withLock {
+            drainScheduled = false
+            state = "Stopped"
+        }
     }
 
     func enqueue(_ datagram: Data) {
@@ -350,50 +380,46 @@ private final class UDPAudioSender: @unchecked Sendable {
     }
 
     private func drainAvailablePackets() {
-        guard let socket else {
+        guard let connection else {
             lock.withLock { drainScheduled = false }
             return
         }
-        while true {
-            guard let datagram = retryDatagram ?? dequeueForDrain() else { return }
-            let sent = datagram.withUnsafeBytes { bytes in
-                MPUdpSenderSend(
-                    socket,
-                    bytes.bindMemory(to: UInt8.self).baseAddress,
-                    bytes.count
-                )
-            }
-            if sent {
-                retryDatagram = nil
-                lock.withLock {
-                    let now = DispatchTime.now().uptimeNanoseconds
-                    if let lastSendTimeNS {
-                        let gap = now - lastSendTimeNS
-                        maxSendGapNS = max(maxSendGapNS, gap)
-                        if gap >= 10_000_000 { sendGapEvents &+= 1 }
-                    }
-                    lastSendTimeNS = now
-                    packetsSent &+= 1
-                    state = "Ready"
-                }
-            } else {
-                retryDatagram = datagram
-                lock.withLock {
-                    sendFailures &+= 1
-                    state = "Waiting: UDP send buffer full"
-                    drainScheduled = false
+        guard let datagram = dequeueForDrain() else {
+            lock.withLock { drainScheduled = false }
+            return
+        }
+
+        connection.send(content: datagram, completion: .contentProcessed {
+            [weak self, weak connection] error in
+            guard let self, let connection,
+                  self.connection === connection else { return }
+            if let error {
+                self.lock.withLock {
+                    self.sendFailures &+= 1
+                    self.drainScheduled = false
+                    self.state = "Send failed: \(error)"
                 }
                 return
             }
-        }
+
+            self.lock.withLock {
+                let now = DispatchTime.now().uptimeNanoseconds
+                if let lastSendTimeNS = self.lastSendTimeNS {
+                    let gap = now - lastSendTimeNS
+                    self.maxSendGapNS = max(self.maxSendGapNS, gap)
+                    if gap >= 10_000_000 { self.sendGapEvents &+= 1 }
+                }
+                self.lastSendTimeNS = now
+                self.packetsSent &+= 1
+                self.state = "Ready"
+            }
+            self.drainAvailablePackets()
+        })
     }
 
     private func dequeueForDrain() -> Data? {
         lock.withLock {
-            guard count > 0 else {
-                drainScheduled = false
-                return nil
-            }
+            guard count > 0 else { return nil }
             let datagram = slots[head]
             slots[head] = nil
             head = (head + 1) % slots.count

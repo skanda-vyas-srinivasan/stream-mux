@@ -161,6 +161,8 @@ int main(int argc, char** argv) {
         DefaultOutput output(audio);
         std::mutex jitter_mutex;
         std::atomic<bool> receive_running{true};
+        std::atomic<std::uint64_t> raw_datagrams{0};
+        std::atomic<std::uint64_t> raw_bytes{0};
         std::atomic<std::uint64_t> malformed_packets{0};
         std::atomic<std::uint64_t> fec_recovered{0};
         std::atomic<std::uint64_t> max_arrival_gap_ns{0};
@@ -175,11 +177,25 @@ int main(int argc, char** argv) {
                 try {
                     const auto size = receiver.receive(datagram);
                     if (size == 0) continue;
+                    const auto datagram_number =
+                        raw_datagrams.fetch_add(1, std::memory_order_relaxed) + 1;
+                    raw_bytes.fetch_add(size, std::memory_order_relaxed);
                     auto decoded = multipoint::protocol::deserialize(
                         std::span<const std::byte>(datagram.data(), size));
                     if (!decoded.packet) {
-                        malformed_packets.fetch_add(1, std::memory_order_relaxed);
+                        const auto malformed =
+                            malformed_packets.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (malformed == 1 || malformed % 100 == 0) {
+                            std::cerr << "raw_udp=" << datagram_number
+                                      << " bytes=" << size
+                                      << " malformed=" << malformed
+                                      << " decode_error=\"" << decoded.error << "\"\n";
+                        }
                         continue;
+                    }
+                    if (datagram_number == 1) {
+                        std::cout << "First valid UDP audio datagram received ("
+                                  << size << " bytes)\n";
                     }
                     const auto arrival = std::chrono::steady_clock::now();
                     if (last_arrival) {
@@ -491,6 +507,8 @@ int main(int argc, char** argv) {
                 std::lock_guard lock(jitter_mutex);
                 const auto& stats = jitter.stats();
                 std::cout << "received=" << stats.packets_received
+                          << " raw_udp=" << raw_datagrams.load()
+                          << " raw_bytes=" << raw_bytes.load()
                           << " lost=" << stats.packets_lost
                           << " reordered=" << stats.packets_reordered
                           << " late=" << stats.late_packets
