@@ -410,17 +410,9 @@ private final class AudioPacketizer {
 }
 
 private final class UDPAudioSender: @unchecked Sendable {
-    private struct QueuedDatagram {
-        let data: Data
-        let enqueuedAtNS: UInt64
-    }
-
-    // Real-time audio is only useful while it is fresh. If the VPN route
-    // stalls, prefer the newest audio instead of replaying an old backlog.
-    private static let maximumQueueAgeNS: UInt64 = 150_000_000
     private let queue: DispatchQueue
     private let lock = NSLock()
-    private var slots: [QueuedDatagram?]
+    private var slots: [Data?]
     private var head = 0
     private var tail = 0
     private var count = 0
@@ -519,10 +511,7 @@ private final class UDPAudioSender: @unchecked Sendable {
                 count -= 1
                 queueDrops &+= 1
             }
-            slots[tail] = QueuedDatagram(
-                data: datagram,
-                enqueuedAtNS: DispatchTime.now().uptimeNanoseconds
-            )
+            slots[tail] = datagram
             tail = (tail + 1) % slots.count
             count += 1
             maxQueueDepth = max(maxQueueDepth, count)
@@ -611,20 +600,12 @@ private final class UDPAudioSender: @unchecked Sendable {
 
     private func dequeueForDrain() -> Data? {
         lock.withLock {
-            let now = DispatchTime.now().uptimeNanoseconds
-            while count > 0 {
-                let queued = slots[head]
-                slots[head] = nil
-                head = (head + 1) % slots.count
-                count -= 1
-                guard let queued else { continue }
-                if now - queued.enqueuedAtNS > Self.maximumQueueAgeNS {
-                    queueDrops &+= 1
-                    continue
-                }
-                return queued.data
-            }
-            return nil
+            guard count > 0 else { return nil }
+            let datagram = slots[head]
+            slots[head] = nil
+            head = (head + 1) % slots.count
+            count -= 1
+            return datagram
         }
     }
 }
