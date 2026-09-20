@@ -23,7 +23,11 @@
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>SoundMux captures screen audio so it can be routed to another device.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>SoundMux sends captured audio to your selected Mac on the local network.</string>
+	<string>SoundMux discovers nearby devices and streams audio between your Mac and iPhone.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_soundmux._udp</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -33,6 +37,7 @@
 	</dict>
 	<key>UIBackgroundModes</key>
 	<array>
+		<string>audio</string>
 		<string>screen-capture</string>
 	</array>
 	<key>UILaunchScreen</key>

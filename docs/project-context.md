@@ -264,18 +264,39 @@ xcodebuild \
 
 The latest run of both builds and the core tests passed.
 
+## Direction pivot: isolated Mac-to-iPhone path
+
+The iOS ScreenCaptureKit stall investigation is intentionally parked. A new
+reverse path is implemented without removing or rewriting the existing path:
+
+```text
+Mac Core Audio global process tap + HAL IOProc
+    -> portable SenderEngine
+    -> UDP
+    -> iPhone Network.framework listener
+    -> portable ReceiverEngine + audio ring
+    -> AVAudioEngine output
+```
+
+The new macOS executable is `multipoint_mac_sender`; the iOS UI exposes a
+separate **Receive Mac audio** section on UDP port `48101`. The reverse path uses
+no ScreenCaptureKit on either platform. The Mac executable embeds its
+`NSAudioCaptureUsageDescription` and requests the distinct System Audio
+Recording permission. Physical iPhone playback is validated and was reported
+artifact-free. The iPhone also sends Previous, Play/Pause, and Next commands
+back to the Mac on the adjacent UDP port (`48102` by default); the Mac maps only
+those fixed messages to media-key events, which require Accessibility access.
+See `docs/mac-to-ios.md` for the exact procedure. Do not resume the iPhone
+ScreenCaptureKit stall work unless this direction is deliberately revisited.
+
 ## Recommended next-session sequence
 
-1. Do not redo the network or synchronized capture diagnosis.
-2. Unlock the already-connected iPhone and launch the installed build.
-3. Start the Mac receiver with clean counters and begin ScreenCaptureKit audio.
-4. Repeat the app-switch stress test with synchronized iPhone/Mac metrics.
-5. When the user says `now`, take a baseline immediately, continue collecting
-   for exactly 10 seconds, then analyze that delta. Do not stop capture at the
-   marker.
-6. Success means the unavoidable capture pause becomes one clean mute/rebuffer
-   transition with no stale catch-up burst or multi-second chopping.
-7. Do not claim the artifact is fixed until the user confirms what they heard.
+1. Build, sign, and install the iOS app containing the reverse receiver.
+2. Tap **Start Receiving** on port `48101`.
+3. Run `multipoint_mac_sender <iphone-ip> 48101`.
+4. Grant macOS System Audio Recording permission if requested.
+5. Play Mac audio and compare sender/iPhone counters while listening.
+6. Only optimize latency after continuous playback is physically proven.
 
 ## Known limitations and later work
 

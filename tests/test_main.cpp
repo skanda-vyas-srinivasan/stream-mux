@@ -205,6 +205,37 @@ void test_receiver_engine_sequence_gap_resync() {
             "sequence gap hard resync count wrong");
 }
 
+void test_receiver_engine_rebuffer_after_source_pause() {
+    multipoint::transport::ReceiverEngine receiver({
+        .reorder_packets = 2,
+        .capacity_packets = 64,
+        .hard_resync_gap_packets = 20,
+        .maximum_fec_groups = 16,
+    });
+    require(receiver.ingest(
+                multipoint::protocol::serialize(make_packet(100)), 1'000).accepted,
+            "pause test rejected packet 100");
+    require(receiver.ingest(
+                multipoint::protocol::serialize(make_packet(101)), 2'000).accepted,
+            "pause test rejected packet 101");
+    require(receiver.pop().packet->header.sequence == 100,
+            "pause test did not start at packet 100");
+    require(receiver.pop().packet->header.sequence == 101,
+            "pause test did not play packet 101");
+
+    receiver.rebuffer();
+    require(receiver.ingest(
+                multipoint::protocol::serialize(make_packet(102)), 3'000).accepted,
+            "pause recovery rejected packet 102");
+    require(receiver.ingest(
+                multipoint::protocol::serialize(make_packet(103)), 4'000).accepted,
+            "pause recovery rejected packet 103");
+    require(receiver.pop().packet->header.sequence == 102,
+            "pause recovery did not restart at the first new packet");
+    require(receiver.snapshot().hard_resyncs == 0,
+            "ordinary source pause incorrectly counted as a hard resync");
+}
+
 void test_packet_rejection() {
     auto bytes = multipoint::protocol::serialize(make_packet(1));
     bytes[0] = std::byte{0};
@@ -305,6 +336,7 @@ int main() {
         test_sender_engine_packetization_and_epoch_reset();
         test_receiver_engine_fec_and_epoch_rejection();
         test_receiver_engine_sequence_gap_resync();
+        test_receiver_engine_rebuffer_after_source_pause();
         test_packet_rejection();
         test_fec_pair_recovery();
         test_sequence_wrap();

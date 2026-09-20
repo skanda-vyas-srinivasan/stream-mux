@@ -17,9 +17,40 @@ std::runtime_error socket_error(const std::string& operation) {
     return std::runtime_error(operation + ": " + std::strerror(errno));
 }
 
+void configure_sender_socket(int fd) {
+    const int send_buffer_bytes = 1 << 20;
+    setsockopt(
+        fd, SOL_SOCKET, SO_SNDBUF,
+        &send_buffer_bytes, sizeof(send_buffer_bytes));
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 }  // namespace
 
 UdpSender::UdpSender(const std::string& host, std::uint16_t port) {
+    // On Apple IPv6-only hotspot networks, getaddrinfo can synthesize a NAT64
+    // address even when `host` is an IPv4 literal. That bypasses routes owned
+    // by IPv4 VPNs such as Tailscale. Preserve numeric IPv4 destinations so
+    // the kernel can select the intended VPN interface.
+    sockaddr_in numeric_ipv4{};
+    if (inet_pton(AF_INET, host.c_str(), &numeric_ipv4.sin_addr) == 1) {
+        numeric_ipv4.sin_family = AF_INET;
+        numeric_ipv4.sin_port = htons(port);
+        fd_ = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd_ < 0) throw socket_error("create UDP socket");
+        configure_sender_socket(fd_);
+        if (connect(
+                fd_, reinterpret_cast<const sockaddr*>(&numeric_ipv4),
+                sizeof(numeric_ipv4)) == 0) {
+            return;
+        }
+        const auto error = socket_error("connect UDP socket");
+        close(fd_);
+        fd_ = -1;
+        throw error;
+    }
+
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
@@ -31,14 +62,7 @@ UdpSender::UdpSender(const std::string& host, std::uint16_t port) {
     for (auto* address = result; address != nullptr; address = address->ai_next) {
         fd_ = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
         if (fd_ < 0) continue;
-        const int send_buffer_bytes = 1 << 20;
-        setsockopt(
-            fd_, SOL_SOCKET, SO_SNDBUF,
-            &send_buffer_bytes, sizeof(send_buffer_bytes));
-        const int flags = fcntl(fd_, F_GETFL, 0);
-        if (flags >= 0) {
-            fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
-        }
+        configure_sender_socket(fd_);
         if (connect(fd_, address->ai_addr, address->ai_addrlen) == 0) break;
         close(fd_);
         fd_ = -1;

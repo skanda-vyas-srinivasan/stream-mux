@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.skandavyas.soundmux.mac-sender</string>
+    <key>CFBundleName</key>
+    <string>SoundMux Mac Sender</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>SoundMux captures Mac system audio so it can play on your selected receiver.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>SoundMux discovers nearby iPhones and sends system audio to the selected receiver.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_soundmux._udp</string>
+    </array>
+</dict>
+</plist>
