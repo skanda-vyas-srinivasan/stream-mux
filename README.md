@@ -1,5 +1,7 @@
 # SoundMux
 
+## IN PROGRESS
+
 SoundMux is a peer-to-peer audio-routing app that sends audio between devices
 over a local network and plays it through the receiver's selected speakers,
 headphones, or AirPods.
