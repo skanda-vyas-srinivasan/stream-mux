@@ -1,0 +1,23 @@
+name: Windows
+
+on:
+  push:
+    branches:
+      - main
+      - feature/windows-receiver
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build-windows -A x64
+
+      - name: Build
+        run: cmake --build build-windows --config Release --parallel
+
+      - name: Test portable core
+        run: ctest --test-dir build-windows -C Release --output-on-failure

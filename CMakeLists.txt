@@ -12,6 +12,10 @@ if(APPLE)
     add_subdirectory(macos/MultiAudioMac)
 endif()
 
+if(WIN32)
+    add_subdirectory(windows)
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
     add_subdirectory(tests)
