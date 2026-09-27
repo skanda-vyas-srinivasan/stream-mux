@@ -8,6 +8,9 @@ pieces of the internet path:
 - an `SMR1` relay envelope carrying an unguessable 128-bit route capability;
 - a standalone UDP relay that maps sender and receiver endpoints, expires idle
   routes, and forwards opaque payloads without decrypting them;
+- a portable bidirectional relay channel that keeps registration, keepalives,
+  audio datagrams, and replies on one UDP socket so the same NAT mapping is
+  used in both directions;
 - relay framing validation and size limits that keep existing audio datagrams
   below the normal network MTU;
 - an adaptive controller that observes packet loss, arrival gaps, round-trip
@@ -19,11 +22,12 @@ The relay payload is the existing SoundMux session or encrypted `SME1`
 datagram. Pairing, device-key verification, authenticated encryption, and
 replay protection remain end to end; the relay is not trusted with audio keys.
 
-This checkpoint is not yet an app-usable internet route. The platform adapters
-still need a bidirectional relay socket, route invitation UI, receiver
-keepalives, and fallback integration with the connection planner. The adaptive
-decision also needs protocol negotiation before it can safely change live
-receiver buffering or FEC parameters.
+This checkpoint is not yet an app-usable internet route. A loopback integration
+test proves opaque payload delivery in both directions through the relay, but
+the Mac, iPhone, and Windows adapters still need to use the relay channel. They
+also need keepalive scheduling, route invitation UI, and fallback integration
+with the connection planner. The adaptive decision needs protocol negotiation
+before it can safely change live receiver buffering or FEC parameters.
 
 ## Adaptive profiles
 
@@ -50,9 +54,10 @@ UDP amplification.
 
 ## Remaining milestones
 
-1. Add a portable bidirectional UDP channel and relay client adapter.
-2. Exercise sender → relay → receiver session pairing in an automated local
-   integration test.
+1. Integrate the portable relay channel with the Mac, iPhone, and Windows
+   sender/receiver adapters, including keepalive scheduling.
+2. Extend the automated relay test from bidirectional opaque payload delivery
+   to a complete authenticated sender/receiver session.
 3. Add receiver feedback fields for loss, jitter, buffered duration, and
    underruns to authenticated heartbeat replies.
 4. Negotiate adaptive profile changes and apply them at safe rebuffer/FEC group

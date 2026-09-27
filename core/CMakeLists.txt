@@ -7,6 +7,7 @@ add_library(multipoint_core STATIC
     jitter/jitter_buffer.cpp
     network/connection_plan.cpp
     network/relay_envelope.cpp
+    network/relay_channel.cpp
     transport/adaptive_controller.cpp
     transport/receiver_engine.cpp
     transport/sender_engine.cpp

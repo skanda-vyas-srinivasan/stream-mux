@@ -1,7 +1,9 @@
 #include "multipoint/audio/spsc_audio_ring.h"
 #include "multipoint/jitter/jitter_buffer.h"
 #include "multipoint/network/connection_plan.h"
+#include "multipoint/network/relay_channel.h"
 #include "multipoint/network/relay_envelope.h"
+#include "multipoint/network/udp_socket.h"
 #include "multipoint/protocol/audio_packet.h"
 #include "multipoint/protocol/fec.h"
 #include "multipoint/protocol/session.h"
@@ -12,12 +14,17 @@
 #include "multipoint/util/sequence.h"
 
 #include <cmath>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -246,6 +253,93 @@ void test_relay_envelope_round_trip_and_rejection() {
         static_cast<std::uint8_t>(RelayMessageType::register_receiver));
     require(!deserialize_relay(control).valid,
             "relay accepted a control-message payload");
+}
+
+void test_bidirectional_relay_channel() {
+    using namespace multipoint::network;
+    UdpReceiver relay(0);
+    const auto relay_port = relay.local_port();
+    RelayRoute route{};
+    for (std::size_t index = 0; index < route.size(); ++index) {
+        route[index] = static_cast<std::byte>(0xa0U + index);
+    }
+    std::atomic<bool> relay_ok{true};
+    std::jthread server([&] {
+        try {
+            std::optional<UdpEndpoint> receiver_endpoint;
+            std::optional<UdpEndpoint> sender_endpoint;
+            std::array<std::byte, kRelayHeaderBytes + kRelayMaximumPayloadBytes>
+                buffer{};
+            int forwarded = 0;
+            for (int attempts = 0; attempts < 40 && forwarded < 2; ++attempts) {
+                UdpEndpoint source;
+                const auto size = relay.receive_from(buffer, source);
+                if (size == 0) continue;
+                const auto decoded = deserialize_relay(
+                    std::span<const std::byte>(buffer.data(), size));
+                if (!decoded.valid || decoded.envelope.route != route) continue;
+                switch (decoded.envelope.type) {
+                    case RelayMessageType::register_receiver:
+                        receiver_endpoint = source;
+                        break;
+                    case RelayMessageType::open_sender:
+                        sender_endpoint = source;
+                        break;
+                    case RelayMessageType::data_to_receiver:
+                        sender_endpoint = source;
+                        if (receiver_endpoint) {
+                            relay.send_to(
+                                std::span<const std::byte>(buffer.data(), size),
+                                *receiver_endpoint);
+                            ++forwarded;
+                        }
+                        break;
+                    case RelayMessageType::data_to_sender:
+                        receiver_endpoint = source;
+                        if (sender_endpoint) {
+                            relay.send_to(
+                                std::span<const std::byte>(buffer.data(), size),
+                                *sender_endpoint);
+                            ++forwarded;
+                        }
+                        break;
+                    case RelayMessageType::keepalive_receiver:
+                    case RelayMessageType::keepalive_sender:
+                        break;
+                }
+            }
+            if (forwarded != 2) relay_ok.store(false);
+        } catch (...) {
+            relay_ok.store(false);
+        }
+    });
+
+    RelayChannel receiver("127.0.0.1", relay_port, 0, route, RelayRole::receiver);
+    RelayChannel sender("127.0.0.1", relay_port, 0, route, RelayRole::sender);
+    receiver.announce();
+    sender.announce();
+    const std::array<std::byte, 4> outbound = {
+        std::byte{4}, std::byte{3}, std::byte{2}, std::byte{1},
+    };
+    sender.send(outbound);
+    std::array<std::byte, 32> received{};
+    std::size_t received_size = 0;
+    for (int attempt = 0; attempt < 10 && received_size == 0; ++attempt) {
+        received_size = receiver.receive(received);
+    }
+    const bool forward_ok = received_size == outbound.size() &&
+        std::equal(outbound.begin(), outbound.end(), received.begin());
+    receiver.send(outbound);
+    received_size = 0;
+    for (int attempt = 0; attempt < 10 && received_size == 0; ++attempt) {
+        received_size = sender.receive(received);
+    }
+    server.join();
+    require(relay_ok.load(), "relay integration loop failed");
+    require(forward_ok, "relay did not deliver sender payload");
+    require(received_size == outbound.size() &&
+            std::equal(outbound.begin(), outbound.end(), received.begin()),
+            "relay did not deliver receiver reply");
 }
 
 void test_adaptive_controller_uses_hysteresis() {
@@ -526,6 +620,7 @@ int main() {
         test_encrypted_session_round_trip_and_tamper_rejection();
         test_connection_plan_prefers_direct_paths_and_deduplicates();
         test_relay_envelope_round_trip_and_rejection();
+        test_bidirectional_relay_channel();
         test_adaptive_controller_uses_hysteresis();
         test_sender_engine_packetization_and_epoch_reset();
         test_receiver_engine_fec_and_epoch_rejection();

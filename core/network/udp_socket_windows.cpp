@@ -51,6 +51,31 @@ void configure_sender_socket(SOCKET socket_value) {
 
 }  // namespace
 
+UdpEndpoint resolve_udp_endpoint(const std::string& host, std::uint16_t port) {
+    (void)winsock();
+    addrinfo hints{};
+    hints.ai_family = AF_INET6;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    hints.ai_flags = AI_V4MAPPED | AI_ALL;
+    addrinfo* result = nullptr;
+    const auto service = std::to_string(port);
+    const int lookup = getaddrinfo(host.c_str(), service.c_str(), &hints, &result);
+    if (lookup != 0) {
+        throw std::runtime_error("resolve UDP endpoint: " + std::to_string(lookup));
+    }
+    UdpEndpoint endpoint;
+    for (auto* address = result; address != nullptr; address = address->ai_next) {
+        if (address->ai_addrlen > endpoint.storage.size()) continue;
+        std::memcpy(endpoint.storage.data(), address->ai_addr, address->ai_addrlen);
+        endpoint.size = static_cast<std::size_t>(address->ai_addrlen);
+        break;
+    }
+    freeaddrinfo(result);
+    if (endpoint.size == 0) throw std::runtime_error("resolve UDP endpoint");
+    return endpoint;
+}
+
 UdpSender::UdpSender(const std::string& host, std::uint16_t port) {
     (void)winsock();
     sockaddr_in numeric_ipv4{};
@@ -205,6 +230,22 @@ void UdpReceiver::send_to(
     if (sent < 0 || static_cast<std::size_t>(sent) != datagram.size()) {
         throw socket_error("send UDP datagram");
     }
+}
+
+std::uint16_t UdpReceiver::local_port() const {
+    sockaddr_storage address{};
+    int size = sizeof(address);
+    if (getsockname(
+            native(fd_), reinterpret_cast<sockaddr*>(&address), &size) != 0) {
+        throw socket_error("read UDP socket address");
+    }
+    if (address.ss_family == AF_INET) {
+        return ntohs(reinterpret_cast<const sockaddr_in*>(&address)->sin_port);
+    }
+    if (address.ss_family == AF_INET6) {
+        return ntohs(reinterpret_cast<const sockaddr_in6*>(&address)->sin6_port);
+    }
+    throw std::runtime_error("unsupported UDP socket family");
 }
 
 }  // namespace multipoint::network

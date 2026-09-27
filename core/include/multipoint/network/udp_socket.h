@@ -13,6 +13,9 @@ struct UdpEndpoint {
     std::size_t size = 0;
 };
 
+[[nodiscard]] UdpEndpoint resolve_udp_endpoint(
+    const std::string& host, std::uint16_t port);
+
 class UdpSender {
 public:
     UdpSender(const std::string& host, std::uint16_t port);
@@ -46,6 +49,7 @@ public:
         std::span<const std::byte> datagram,
         const UdpEndpoint& destination,
         std::uint16_t port_override = 0);
+    [[nodiscard]] std::uint16_t local_port() const;
 
 private:
 #ifdef _WIN32
