@@ -2,7 +2,8 @@
 
 set -euo pipefail
 
-receiver="/Users/skandavyas/multipoint/build/macos/MultiAudioMac/multipoint_receiver"
+script_dir="${0:A:h}"
+receiver="$script_dir/build/macos/MultiAudioMac/multipoint_receiver"
 port="${1:-48100}"
 
 if (( $# > 1 )); then

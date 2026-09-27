@@ -34,6 +34,12 @@ renders through AVAudioEngine. This direction does not use ScreenCaptureKit on
 either device. It has been validated on a physical iPhone with artifact-free
 playback.
 
+The Mac sender converts stereo float32 capture audio to the fixed 48 kHz wire
+format on its sending worker. Capture at 48 kHz passes through unchanged;
+other sample rates use AudioToolbox conversion. Automated conversion tests
+cover 32, 44.1, 48, 88.2, 96, and 192 kHz. Physical validation of non-48-kHz
+capture remains pending.
+
 The portable C++20 core provides reusable sender and receiver engines around
 packet serialization, stream epochs, UDP adapters, jitter buffering, an audio
 ring buffer, hard resynchronization, and 10-data + 5-parity erasure coding.
@@ -77,10 +83,10 @@ The iOS receiver declares background audio playback, so an active stream keeps
 playing when SoundMux is backgrounded or the phone is locked. It cannot keep
 running after the user force-quits the app.
 
-For an interactive zsh configured with the repository shortcut, use `run` for
-the default port `48100` and `100` ms latency, or `run <port> <latency-ms>` to
-override them. Use `stop` to stop the receiver on port `48100`, or
-`stop <port>` for a custom port.
+Use `./run` for the default receiver port `48100` and `100` ms latency, or
+`./run <port> <latency-ms>` to override them. Use `./stop` to stop this
+checkout's receiver on port `48100`, or `./stop <port>` for a custom port.
+The launcher scripts resolve their build paths relative to their own location.
 
 Build the iPhone sender from
 `ios/MultiAudioIOS/MultiAudioIOS.xcodeproj` using Xcode 27 and a physical iPhone

@@ -3,6 +3,7 @@
 #include "multipoint/network/udp_socket.h"
 #include "multipoint/protocol/audio_packet.h"
 #include "multipoint/transport/sender_engine.h"
+#include "stereo_sample_rate_converter.h"
 
 #import <CoreAudio/AudioHardware.h>
 #import <CoreAudio/AudioHardwareTapping.h>
@@ -77,13 +78,7 @@ std::uint16_t control_port_for(std::uint16_t audio_port) {
     return static_cast<std::uint16_t>(audio_port + 1);
 }
 
-bool request_media_control_access(bool prompt) {
-    if (!prompt) return AXIsProcessTrusted();
-    NSDictionary* options = @{
-        (__bridge NSString*)kAXTrustedCheckOptionPrompt: @YES,
-    };
-    return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
-}
+bool has_media_control_access() { return AXIsProcessTrusted(); }
 
 void post_media_key(int key_type) {
     @autoreleasepool {
@@ -130,9 +125,18 @@ public:
               control_port_for(port))),
           sender_(multipoint::clock::monotonic_time_ns()),
           audio_ring_(kCaptureRingFrames, multipoint::protocol::kChannelCount) {
-        create_tap();
-        create_aggregate_device();
-        create_io_proc();
+        try {
+            create_tap();
+            converter_ = std::make_unique<multipoint::macos::StereoSampleRateConverter>(
+                tap_format_.mSampleRate, audio_ring_);
+            create_aggregate_device();
+            create_io_proc();
+        } catch (...) {
+            // The destructor is not called if construction fails after creating
+            // a tap, converter, or aggregate device.
+            stop();
+            throw;
+        }
     }
 
     ~CoreAudioTapSender() { stop(); }
@@ -160,6 +164,7 @@ public:
         }
         if (send_thread_.joinable()) send_thread_.join();
         if (control_thread_.joinable()) control_thread_.join();
+        converter_.reset();
         if (aggregate_device_ != kAudioObjectUnknown && io_proc_) {
             AudioDeviceDestroyIOProcID(aggregate_device_, io_proc_);
             io_proc_ = nullptr;
@@ -185,7 +190,7 @@ public:
             .control_commands = control_commands_.load(std::memory_order_relaxed),
             .control_failures = control_failures_.load(std::memory_order_relaxed),
             .ring_frames = audio_ring_.available_to_read(),
-            .media_control_access = request_media_control_access(false),
+            .media_control_access = has_media_control_access(),
         };
     }
 
@@ -228,12 +233,6 @@ private:
             tap_format_.mChannelsPerFrame != multipoint::protocol::kChannelCount) {
             throw std::runtime_error(
                 "Core Audio tap did not provide packed float32 stereo");
-        }
-        if (tap_format_.mSampleRate != multipoint::protocol::kSampleRate) {
-            throw std::runtime_error(
-                "Core Audio tap sample rate is " +
-                std::to_string(tap_format_.mSampleRate) +
-                " Hz; SoundMux currently requires 48000 Hz");
         }
     }
 
@@ -315,16 +314,16 @@ private:
     void send_loop() {
         std::array<float, multipoint::protocol::kSamplesPerPacket> packet_samples{};
         while (running_.load(std::memory_order_acquire)) {
-            if (audio_ring_.available_to_read() <
-                multipoint::protocol::kFramesPerPacket) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;
-            }
-            audio_ring_.read(
-                packet_samples.data(), multipoint::protocol::kFramesPerPacket);
             try {
+                const auto frames = converter_->read(packet_samples);
+                if (frames == 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    continue;
+                }
                 const auto datagrams = sender_.push_audio(
-                    packet_samples, multipoint::clock::monotonic_time_ns());
+                    std::span<const float>(packet_samples.data(),
+                        frames * multipoint::protocol::kChannelCount),
+                    multipoint::clock::monotonic_time_ns());
                 const auto stats = sender_.stats();
                 audio_packets_.store(stats.audio_packets, std::memory_order_relaxed);
                 parity_packets_.store(stats.parity_packets, std::memory_order_relaxed);
@@ -333,8 +332,9 @@ private:
                 const auto failures =
                     send_failures_.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (failures == 1 || failures % 100 == 0) {
-                    std::cerr << "send error: " << error.what() << '\n';
+                    std::cerr << "sender pipeline error: " << error.what() << '\n';
                 }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
     }
@@ -359,7 +359,7 @@ private:
                 }
 
                 control_commands_.fetch_add(1, std::memory_order_relaxed);
-                if (!request_media_control_access(false)) {
+                if (!has_media_control_access()) {
                     control_failures_.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
@@ -378,6 +378,7 @@ private:
     std::unique_ptr<multipoint::network::UdpReceiver> control_receiver_;
     multipoint::transport::SenderEngine sender_;
     multipoint::audio::SpscAudioRing audio_ring_;
+    std::unique_ptr<multipoint::macos::StereoSampleRateConverter> converter_;
     std::array<float, kMaximumIOFrames * multipoint::protocol::kChannelCount>
         capture_scratch_{};
     AudioObjectID tap_ = kAudioObjectUnknown;
@@ -746,7 +747,6 @@ private:
     [NSUserDefaults.standardUserDefaults
         setObject:[NSString stringWithFormat:@"%ld", (long)port_number]
                                              forKey:@"receiverPort"];
-    request_media_control_access(true);
     _starting = YES;
     _hostField.enabled = NO;
     _portField.enabled = NO;
@@ -849,7 +849,8 @@ int main(int argc, char** argv) {
             std::cout << "Streaming pure Core Audio system output to " << host << ':'
                       << port_number << "\nFormat: " << format.mSampleRate << " Hz, "
                       << format.mChannelsPerFrame
-                      << " channels, float32 (Ctrl-C to stop)\n";
+                      << " channels, float32 -> 48000 Hz stereo PCM16 wire"
+                      << " (Ctrl-C to stop)\n";
 
             auto next_stats = std::chrono::steady_clock::now() + std::chrono::seconds(1);
             while (g_running) {

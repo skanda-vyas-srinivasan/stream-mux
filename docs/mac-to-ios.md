@@ -5,6 +5,7 @@ This is an isolated transport direction that does not use iOS ScreenCaptureKit:
 ```text
 macOS Core Audio global process tap
     -> private HAL aggregate device + IOProc
+    -> capture ring -> worker-side conversion to 48 kHz stereo float32
     -> C++ SenderEngine (PCM16 packets + delayed 10+5 FEC)
     -> UDP
     -> iOS Network.framework listener
@@ -63,7 +64,8 @@ bundle identifier.
    Mac media app. Grant **Accessibility** access to SoundMux Sender if macOS
    prompts; this is separate from audio-capture permission.
 
-The sender prints capture, packet, conversion-drop, and send-failure counters.
+The CLI reports the capture sample rate and fixed 48 kHz wire rate at startup.
+The sender prints capture, packet, capture-drop, and sender-failure counters.
 The iPhone shows raw datagrams, decoded audio packets, FEC recovery, loss,
 concealment, hard resyncs, audio underruns, and buffered duration.
 
@@ -79,11 +81,18 @@ concealment, hard resyncs, audio underruns, and buffered duration.
   control commands return on the next UDP port (`48102` by default); no
   arbitrary input is executed.
 - Fixed 48 kHz stereo PCM16 wire format.
-- The first sender version expects the current Mac output/tap format to be
-  48 kHz stereo float32 and reports a clear error otherwise; a sender-side
-  sample-rate converter is the next compatibility step.
-- Roughly 60 ms receiver prebuffer, plus network/jitter and device-output
-  latency.
+- The Mac tap must supply packed stereo float32, either interleaved or planar.
+  A persistent AudioToolbox converter on the sending worker normalizes other
+  sample rates to 48 kHz; 48 kHz input bypasses conversion. The capture callback
+  only interleaves/copies audio into the capture ring. Temporary input gaps
+  preserve converter state without adding silence or replaying old samples.
+- Conversion tests cover 32, 44.1, 48, 88.2, 96, and 192 kHz. Non-48-kHz
+  physical playback is not yet validated. Disconnect and reconnect after a
+  Mac device/sample-rate change; automatic live format reconfiguration is
+  still future work.
+- The receiver uses a 60 ms audio-ring prebuffer and a 12-packet jitter
+  threshold, plus conversion, network, and device-output latency. Its displayed
+  buffered duration counts only the audio ring, not end-to-end latency.
 - iOS background audio mode is enabled, so an active stream can continue while
   using other apps or while the phone is locked. Force-quitting SoundMux still
   stops the receiver,
@@ -102,3 +111,19 @@ concealment, hard resyncs, audio underruns, and buffered duration.
   underruns on a healthy LAN.
 - Stopping and restarting the Mac sender produces one clean receiver rebuffer,
   not stale replay.
+
+## Sample-rate validation
+
+Run `ctest --test-dir build --output-on-failure`. The macOS-only
+`soundmux_capture_conversion_tests` exercises rate/duration, pitch, channel
+separation, anti-aliasing, exact 48 kHz bypass, irregular chunks, repeated empty
+input polls, and converted PCM16 packet contents without using audio hardware.
+
+For a physical pass, disconnect the sender, choose a supported Mac output rate
+in Audio MIDI Setup (start with 44.1 kHz, then 48 and 96 kHz where available),
+and reconnect. Use the CLI startup line to confirm the actual tap rate; a
+device's configured rate alone does not prove that the tap uses it. Listen for
+pitch changes, gaps, or clicks and compare capture drops, sender failures,
+receiver losses, concealment, and underruns over a sustained stream. Restore
+the original output rate afterward. Record hardware, actual tap rate, duration,
+and counter deltas before calling a rate physically validated.

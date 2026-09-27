@@ -1,9 +1,19 @@
 add_executable(multipoint_sine_sender synthetic_sender.cpp)
 target_link_libraries(multipoint_sine_sender PRIVATE multipoint_core)
 
+add_library(soundmux_capture_conversion stereo_sample_rate_converter.cpp)
+target_include_directories(soundmux_capture_conversion PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(soundmux_capture_conversion PUBLIC
+    multipoint_core
+    "-framework AudioToolbox"
+)
+target_compile_options(soundmux_capture_conversion PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
+)
+
 add_executable(multipoint_mac_sender sender_main.mm)
 target_link_libraries(multipoint_mac_sender PRIVATE
-    multipoint_core
+    soundmux_capture_conversion
     "-framework AppKit"
     "-framework ApplicationServices"
     "-framework CoreAudio"
@@ -18,7 +28,7 @@ target_link_options(multipoint_mac_sender PRIVATE
 
 add_executable(soundmux_sender_app MACOSX_BUNDLE sender_main.mm)
 target_link_libraries(soundmux_sender_app PRIVATE
-    multipoint_core
+    soundmux_capture_conversion
     "-framework AppKit"
     "-framework ApplicationServices"
     "-framework CoreAudio"
