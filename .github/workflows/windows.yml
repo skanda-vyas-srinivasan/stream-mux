@@ -21,3 +21,15 @@ jobs:
 
       - name: Test portable core
         run: ctest --test-dir build-windows -C Release --output-on-failure
+
+      - name: Smoke-test receiver executable
+        run: .\build-windows\windows\Release\soundmux_windows_receiver.exe --help
+
+      - name: Publish receiver executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: soundmux-windows-receiver-${{ github.sha }}
+          path: |
+            build-windows/windows/Release/soundmux_windows_receiver.exe
+            windows/README.md
+          if-no-files-found: error

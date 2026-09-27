@@ -51,6 +51,11 @@ std::string computer_name() {
 
 int main(int argc, char **argv) {
   try {
+    if (argc == 2 && std::string(argv[1]) == "--help") {
+      std::cout << "Usage: soundmux_windows_receiver [port] [latency-ms]\n"
+                << "Defaults: UDP port 48100, target latency 100 ms.\n";
+      return EXIT_SUCCESS;
+    }
     const auto port =
         argc > 1 ? parse_number(argv[1], 1, 65'534, "UDP port") : 48'100U;
     const auto latency =

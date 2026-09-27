@@ -38,6 +38,15 @@ other sample rates use AudioToolbox conversion. Automated conversion tests
 cover 32, 44.1, 48, 88.2, 96, and 192 kHz. Physical validation of non-48-kHz
 capture remains pending.
 
+An initial **Mac to Windows** receiver is available on the
+`feature/windows-receiver` branch. It reuses the same encrypted session,
+packet, FEC, and jitter engines through the Winsock backend and renders through
+event-driven shared-mode WASAPI. Its command-line build supports manual-IP
+connection, first-use comparison-code approval, DPAPI-protected receiver
+identity, remembered sender trust, reconnection, and live diagnostics. It
+builds and passes the portable tests under MSVC; physical listening validation,
+automatic discovery, and a native Windows UI remain pending.
+
 The portable C++20 core provides reusable sender and receiver engines around
 packet serialization, stream epochs, UDP adapters for POSIX and Winsock,
 jitter buffering, an audio ring buffer, hard resynchronization, a portable
