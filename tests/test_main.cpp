@@ -6,6 +6,7 @@
 #include "multipoint/protocol/session.h"
 #include "multipoint/protocol/session_crypto.h"
 #include "multipoint/transport/receiver_engine.h"
+#include "multipoint/transport/fanout_sender.h"
 #include "multipoint/transport/sender_engine.h"
 #include "multipoint/util/sequence.h"
 
@@ -249,6 +250,45 @@ void test_sender_engine_packetization_and_epoch_reset() {
     require(decoded.packet->header.sample_index == 0, "sender reset sample index wrong");
 }
 
+void test_fanout_sender_keeps_peer_timelines_independent() {
+    multipoint::transport::FanoutSender fanout;
+    fanout.add_peer("phone", 1'001);
+    fanout.add_peer("pc", 2'002);
+    require(fanout.size() == 2, "fanout did not retain both peers");
+
+    std::vector<float> samples(
+        multipoint::protocol::kSamplesPerPacket * 10, 0.2F);
+    const auto first = fanout.push_audio(samples, 5'000);
+    require(first.size() == 2, "fanout did not emit for every peer");
+    for (const auto& peer : first) {
+        require(peer.datagrams.size() == 10,
+                "fanout peer emitted wrong first-group audio count");
+        const auto decoded = multipoint::protocol::deserialize(
+            peer.datagrams.front());
+        require(decoded.packet.has_value(), "fanout emitted malformed audio");
+        const auto expected_stream = peer.peer_id == "phone" ? 1'001U : 2'002U;
+        require(decoded.packet->header.stream_id == expected_stream,
+                "fanout mixed peer stream epochs");
+        require(decoded.packet->header.sequence == 0,
+                "fanout peer did not start at sequence zero");
+    }
+
+    require(fanout.remove_peer("phone"), "fanout could not remove handoff source");
+    require(!fanout.contains("phone") && fanout.contains("pc"),
+            "fanout removed the wrong handoff peer");
+    const auto second = fanout.push_audio(
+        std::span<const float>(
+            samples.data(), multipoint::protocol::kSamplesPerPacket),
+        10'000);
+    require(second.size() == 1 && second.front().peer_id == "pc",
+            "fanout continued sending to retired handoff source");
+    const auto decoded = multipoint::protocol::deserialize(
+        second.front().datagrams.front());
+    require(decoded.packet.has_value() &&
+            decoded.packet->header.sequence == 10,
+            "remaining fanout peer timeline was reset during handoff");
+}
+
 void test_receiver_engine_fec_and_epoch_rejection() {
     multipoint::transport::SenderEngine sender(7001);
     multipoint::transport::ReceiverEngine receiver({
@@ -456,6 +496,7 @@ int main() {
         test_encrypted_session_round_trip_and_tamper_rejection();
         test_connection_plan_prefers_direct_paths_and_deduplicates();
         test_sender_engine_packetization_and_epoch_reset();
+        test_fanout_sender_keeps_peer_timelines_independent();
         test_receiver_engine_fec_and_epoch_rejection();
         test_receiver_engine_sequence_gap_resync();
         test_receiver_engine_rebuffer_after_source_pause();

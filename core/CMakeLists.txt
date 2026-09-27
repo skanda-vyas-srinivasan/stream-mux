@@ -7,6 +7,7 @@ add_library(multipoint_core STATIC
     jitter/jitter_buffer.cpp
     network/connection_plan.cpp
     transport/receiver_engine.cpp
+    transport/fanout_sender.cpp
     transport/sender_engine.cpp
 )
 
