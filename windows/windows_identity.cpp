@@ -4,8 +4,8 @@
 #error "windows_identity.cpp is only for Windows"
 #endif
 
-#include <wincrypt.h>
 #include <windows.h>
+#include <wincrypt.h>
 
 #include <array>
 #include <cstddef>
