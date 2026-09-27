@@ -134,6 +134,16 @@ void test_session_protocol_round_trip_and_rejection() {
     const auto audio = serialize(make_packet(5));
     require(!deserialize_session(audio).recognized,
             "audio datagram was misidentified as session control");
+
+    const auto profile = serialize_session({
+        .type = SessionMessageType::profile,
+        .fields = {{"latency_ms", "180"}},
+    });
+    const auto profile_result = deserialize_session(profile);
+    require(profile_result.valid &&
+            profile_result.message.type == SessionMessageType::profile &&
+            profile_result.message.fields.at("latency_ms") == "180",
+            "adaptive profile message did not round trip");
 }
 
 void test_encrypted_session_round_trip_and_tamper_rejection() {
@@ -271,7 +281,7 @@ void test_bidirectional_relay_channel() {
             std::array<std::byte, kRelayHeaderBytes + kRelayMaximumPayloadBytes>
                 buffer{};
             int forwarded = 0;
-            for (int attempts = 0; attempts < 40 && forwarded < 2; ++attempts) {
+            for (int attempts = 0; attempts < 60 && forwarded < 4; ++attempts) {
                 UdpEndpoint source;
                 const auto size = relay.receive_from(buffer, source);
                 if (size == 0) continue;
@@ -308,7 +318,7 @@ void test_bidirectional_relay_channel() {
                         break;
                 }
             }
-            if (forwarded != 2) relay_ok.store(false);
+            if (forwarded != 4) relay_ok.store(false);
         } catch (...) {
             relay_ok.store(false);
         }
@@ -322,7 +332,7 @@ void test_bidirectional_relay_channel() {
         std::byte{4}, std::byte{3}, std::byte{2}, std::byte{1},
     };
     sender.send(outbound);
-    std::array<std::byte, 32> received{};
+    std::array<std::byte, kRelayMaximumPayloadBytes> received{};
     std::size_t received_size = 0;
     for (int attempt = 0; attempt < 10 && received_size == 0; ++attempt) {
         received_size = receiver.receive(received);
@@ -334,12 +344,55 @@ void test_bidirectional_relay_channel() {
     for (int attempt = 0; attempt < 10 && received_size == 0; ++attempt) {
         received_size = sender.receive(received);
     }
-    server.join();
-    require(relay_ok.load(), "relay integration loop failed");
     require(forward_ok, "relay did not deliver sender payload");
     require(received_size == outbound.size() &&
             std::equal(outbound.begin(), outbound.end(), received.begin()),
             "relay did not deliver receiver reply");
+
+    using namespace multipoint::protocol;
+    const auto hello = serialize_session({
+        .type = SessionMessageType::hello,
+        .fields = {{"device_id", "relay-test-sender"}, {"session", "3"}},
+    });
+    sender.send(hello);
+    received_size = 0;
+    for (int attempt = 0; attempt < 10 && received_size == 0; ++attempt) {
+        received_size = receiver.receive(received);
+    }
+    const auto decoded_hello = deserialize_session(
+        std::span<const std::byte>(received.data(), received_size));
+    require(decoded_hello.valid &&
+            decoded_hello.message.type == SessionMessageType::hello,
+            "relay did not preserve a session handshake");
+
+    const auto sender_key = generate_device_key_pair();
+    const auto receiver_key = generate_device_key_pair();
+    CryptoNonce client_nonce{};
+    CryptoNonce server_nonce{};
+    require(secure_random(client_nonce) && secure_random(server_nonce),
+            "relay session nonce generation failed");
+    const auto secrets = derive_session_secrets(
+        sender_key.secret, receiver_key.public_key, sender_key.public_key,
+        receiver_key.public_key, client_nonce, server_nonce);
+    SessionCipher relay_encryptor(
+        secrets.sender_to_receiver_key, secrets.sender_nonce_prefix);
+    SessionCipher relay_decryptor(
+        secrets.sender_to_receiver_key, secrets.sender_nonce_prefix);
+    const std::array<std::byte, 5> secret_audio = {
+        std::byte{9}, std::byte{8}, std::byte{7}, std::byte{6}, std::byte{5},
+    };
+    sender.send(relay_encryptor.encrypt(secret_audio));
+    received_size = 0;
+    for (int attempt = 0; attempt < 10 && received_size == 0; ++attempt) {
+        received_size = receiver.receive(received);
+    }
+    const auto opened = relay_decryptor.decrypt(
+        std::span<const std::byte>(received.data(), received_size));
+    server.join();
+    require(relay_ok.load(), "relay integration loop failed");
+    require(opened.valid && opened.plaintext ==
+            std::vector<std::byte>(secret_audio.begin(), secret_audio.end()),
+            "relay did not preserve authenticated encrypted payloads");
 }
 
 void test_adaptive_controller_uses_hysteresis() {
@@ -574,6 +627,16 @@ void test_jitter_reorder_loss_and_duplicate() {
     require(!jitter.started() && jitter.depth() == 0, "rebuffer did not pause");
     require(jitter.stats().packets_received == received_before_rebuffer,
             "rebuffer erased cumulative statistics");
+
+    jitter.set_target_packets(5);
+    for (std::uint32_t sequence = 100; sequence < 104; ++sequence) {
+        require(jitter.insert(make_packet(sequence)), "retarget insert failed");
+    }
+    require(jitter.pop().status == multipoint::jitter::PopStatus::not_ready,
+            "retargeted jitter buffer started too early");
+    require(jitter.insert(make_packet(104)), "retarget final insert failed");
+    require(jitter.pop().packet->header.sequence == 100,
+            "retargeted jitter buffer started at the wrong packet");
 }
 
 void test_audio_ring() {

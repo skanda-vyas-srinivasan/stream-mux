@@ -29,6 +29,7 @@ struct ContentView: View {
                         receiverCard
                         pairedDevicesCard
                         outputCard
+                        internetCard
                         diagnosticsCard
                         advancedCard
                     }
@@ -358,6 +359,37 @@ struct ContentView: View {
             .font(.subheadline)
 
         }
+        .padding(18)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+    }
+
+    private var internetCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Toggle(isOn: $receiver.useInternetRelay) {
+                Label("Internet relay", systemImage: "network")
+                    .font(.headline)
+            }
+            .disabled(receiver.isListening)
+
+            Text("Use the same relay and private route code on the sending Mac. Audio remains end-to-end encrypted.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if receiver.useInternetRelay {
+                TextField("Relay host", text: $receiver.relayHost)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .disabled(receiver.isListening)
+                TextField("Relay UDP port", text: $receiver.relayPort)
+                    .keyboardType(.numberPad)
+                    .disabled(receiver.isListening)
+                SecureField("32-character route code", text: $receiver.relayRoute)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .disabled(receiver.isListening)
+            }
+        }
+        .textFieldStyle(.roundedBorder)
         .padding(18)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
     }

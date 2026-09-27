@@ -205,6 +205,12 @@ bool ReceiverEngine::advance_to_oldest_available() {
     return impl_->jitter.advance_to_oldest_available();
 }
 
+void ReceiverEngine::set_reorder_packets(std::size_t target_packets) {
+    std::lock_guard lock(mutex_);
+    impl_->jitter.set_target_packets(target_packets);
+    impl_->fec_groups.clear();
+}
+
 void ReceiverEngine::rebuffer() {
     std::lock_guard lock(mutex_);
     impl_->jitter.rebuffer();

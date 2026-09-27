@@ -243,6 +243,12 @@ struct TrustedSoundMuxDevice: Identifiable, Sendable, Equatable {
     let name: String
 }
 
+private struct SoundMuxRelayConfiguration: Sendable {
+    let host: String
+    let port: UInt16
+    let route: String
+}
+
 private enum SoundMuxSessionKind: String {
     case hello = "HELLO"
     case pairRequired = "PAIR_REQUIRED"
@@ -250,6 +256,7 @@ private enum SoundMuxSessionKind: String {
     case welcome = "WELCOME"
     case ping = "PING"
     case pong = "PONG"
+    case profile = "PROFILE"
 }
 
 private struct SoundMuxSessionMessage {
@@ -360,6 +367,18 @@ final class ReverseAudioReceiver: ObservableObject {
             UserDefaults.standard.set(targetLatencyMs, forKey: "receiverTargetLatencyMs")
         }
     }
+    @Published var useInternetRelay: Bool {
+        didSet { UserDefaults.standard.set(useInternetRelay, forKey: "useInternetRelay") }
+    }
+    @Published var relayHost: String {
+        didSet { UserDefaults.standard.set(relayHost, forKey: "relayHost") }
+    }
+    @Published var relayPort: String {
+        didSet { UserDefaults.standard.set(relayPort, forKey: "relayPort") }
+    }
+    @Published var relayRoute: String {
+        didSet { UserDefaults.standard.set(relayRoute, forKey: "relayRoute") }
+    }
 
     private let pipeline = ReverseReceiverPipeline()
     private let deviceID: String
@@ -373,6 +392,10 @@ final class ReverseAudioReceiver: ObservableObject {
         targetLatencyMs = defaults.object(forKey: "receiverTargetLatencyMs") == nil
             ? 60
             : defaults.double(forKey: "receiverTargetLatencyMs")
+        useInternetRelay = defaults.bool(forKey: "useInternetRelay")
+        relayHost = defaults.string(forKey: "relayHost") ?? ""
+        relayPort = defaults.string(forKey: "relayPort") ?? "48200"
+        relayRoute = defaults.string(forKey: "relayRoute") ?? ""
         deviceName = defaults.string(forKey: "soundMuxDeviceName")
             ?? UIDevice.current.name
         if let existing = defaults.string(forKey: "soundMuxDeviceID") {
@@ -395,6 +418,19 @@ final class ReverseAudioReceiver: ObservableObject {
             errorMessage = "Enter a receiver name."
             return
         }
+        var relay: SoundMuxRelayConfiguration?
+        if useInternetRelay {
+            let host = relayHost.trimmingCharacters(in: .whitespacesAndNewlines)
+            let route = relayRoute.trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard !host.isEmpty, let port = UInt16(relayPort), port > 0,
+                  route.count == 32,
+                  route.allSatisfy({ $0.isHexDigit }) else {
+                errorMessage = "Enter a relay host, UDP port, and 32-character route code."
+                return
+            }
+            relay = .init(host: host, port: port, route: route)
+        }
         errorMessage = nil
         do {
             let prebufferFrames = Int(48_000 * targetLatencyMs / 1_000)
@@ -406,6 +442,7 @@ final class ReverseAudioReceiver: ObservableObject {
                 receiverID: deviceID,
                 receiverName: advertisedName,
                 volume: outputVolume,
+                relay: relay,
                 snapshotHandler: { [weak self] snapshot in
                     Task { @MainActor [weak self] in self?.apply(snapshot) }
                 },
@@ -490,11 +527,20 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
         label: "com.skandavyas.multipoint.reverse-playout",
         qos: .userInteractive
     )
+    private let relayQueue = DispatchQueue(
+        label: "com.skandavyas.multipoint.reverse-relay",
+        qos: .userInteractive
+    )
     private let receiverLock = NSLock()
+    private let relayStateLock = NSLock()
     private var receiver: MPReceiverEngineRef?
     private var listener: NWListener?
     private var peers: [ObjectIdentifier: ReceiverPeer] = [:]
     private var activePeer: ReceiverPeer?
+    private var relayPeer: ReceiverPeer?
+    private var relayChannel: MPRelayChannelRef?
+    private var relayRunning = false
+    private var relayKeepaliveTimer: DispatchSourceTimer?
     private var pumpTimer: DispatchSourceTimer?
     private var metricsTimer: DispatchSourceTimer?
     private var inactiveObserver: NSObjectProtocol?
@@ -513,8 +559,9 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
     private var deviceKey: SoundMuxDeviceKey?
 
     private final class ReceiverPeer: @unchecked Sendable {
-        let connection: NWConnection
-        let host: NWEndpoint.Host
+        let connection: NWConnection?
+        let host: NWEndpoint.Host?
+        let isRelay: Bool
         var senderID = ""
         var senderName = "Unknown device"
         var platform = "unknown"
@@ -531,6 +578,13 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
         init(connection: NWConnection, host: NWEndpoint.Host) {
             self.connection = connection
             self.host = host
+            isRelay = false
+        }
+
+        init(relay: Void) {
+            connection = nil
+            host = nil
+            isRelay = true
         }
     }
 
@@ -541,6 +595,7 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
         receiverID: String,
         receiverName: String,
         volume: Float,
+        relay: SoundMuxRelayConfiguration?,
         snapshotHandler: @escaping @Sendable (ReverseReceiverSnapshot) -> Void,
         pairingHandler: @escaping @Sendable (PendingSoundMuxPairing?) -> Void
     ) throws {
@@ -565,6 +620,7 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
         do {
             try startAudio(receiver: receiver)
             try startListener(port: port)
+            if let relay { try startRelay(relay) }
             startTimers()
         } catch {
             stop()
@@ -580,15 +636,22 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
         networkQueue.sync {
             metricsTimer?.cancel()
             metricsTimer = nil
+            relayKeepaliveTimer?.cancel()
+            relayKeepaliveTimer = nil
             listener?.cancel()
             listener = nil
             for peer in peers.values {
-                peer.connection.cancel()
+                peer.connection?.cancel()
                 peer.controlConnection?.cancel()
             }
             peers.removeAll()
             activePeer = nil
+            relayPeer = nil
         }
+        relayStateLock.withLock { relayRunning = false }
+        relayQueue.sync {}
+        MPRelayChannelDestroy(relayChannel)
+        relayChannel = nil
         playoutQueue.sync {
             pumpTimer?.cancel()
             pumpTimer = nil
@@ -851,22 +914,61 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
         }
     }
 
+    private func startRelay(_ configuration: SoundMuxRelayConfiguration) throws {
+        let channel = configuration.host.withCString { host in
+            configuration.route.withCString { route in
+                MPRelayChannelCreate(
+                    host, configuration.port, route, Int32(MPRelayRoleReceiver))
+            }
+        }
+        guard let channel, MPRelayChannelAnnounce(channel) else {
+            MPRelayChannelDestroy(channel)
+            throw ReceiverError.relayUnavailable
+        }
+        relayChannel = channel
+        let peer = ReceiverPeer(relay: ())
+        relayPeer = peer
+        relayStateLock.withLock { relayRunning = true }
+
+        relayQueue.async { [weak self, weak peer] in
+            var buffer = [UInt8](repeating: 0, count: 1_432)
+            while let self, self.relayStateLock.withLock({ self.relayRunning }) {
+                guard let channel = self.relayChannel else { break }
+                var size = 0
+                let received = MPRelayChannelReceive(
+                    channel, &buffer, buffer.count, &size)
+                guard received, size > 0 else { continue }
+                let datagram = Data(buffer.prefix(size))
+                self.networkQueue.async { [weak self, weak peer] in
+                    guard let self, let peer, self.relayPeer === peer else { return }
+                    self.process(datagram, from: peer)
+                }
+            }
+        }
+
+        let keepalive = DispatchSource.makeTimerSource(queue: networkQueue)
+        keepalive.schedule(deadline: .now() + .seconds(10), repeating: .seconds(10))
+        keepalive.setEventHandler { [weak self] in
+            guard let channel = self?.relayChannel else { return }
+            _ = MPRelayChannelKeepalive(channel)
+        }
+        keepalive.resume()
+        relayKeepaliveTimer = keepalive
+    }
+
     func send(_ command: RemoteMediaCommand) {
         networkQueue.async { [weak self] in
             guard let peer = self?.activePeer,
-                  let connection = peer.controlConnection,
                   let payload = peer.outboundCipher?.seal(command.payload) else { return }
-            connection.send(
-                content: payload,
-                completion: .contentProcessed { _ in }
-            )
+            self?.sendDatagram(payload, to: peer)
         }
     }
 
     private func connectControls(for peer: ReceiverPeer, port: UInt16) {
         peer.controlConnection?.cancel()
+        guard !peer.isRelay, let host = peer.host else { return }
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else { return }
-        let connection = NWConnection(host: peer.host, port: endpointPort, using: .udp)
+        let connection = NWConnection(host: host, port: endpointPort, using: .udp)
         peer.controlConnection = connection
         connection.stateUpdateHandler = { [weak connection] state in
             guard let connection, peer.controlConnection === connection else {
@@ -883,26 +985,35 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
             guard let self, let connection else { return }
             if let data, !data.isEmpty {
                 guard let peer = self.peers[ObjectIdentifier(connection)] else { return }
-                peer.lastSeen = DispatchTime.now().uptimeNanoseconds
-                if peer.authorized {
-                    guard case .plaintext(let plaintext) = peer.inboundCipher?.open(data) else {
-                        if error == nil { self.receiveNext(on: connection) }
-                        return
-                    }
-                    if let message = SoundMuxSessionMessage.decode(plaintext) {
-                        self.handleSession(message, from: peer)
-                    } else {
-                        self.ingestAudio(plaintext)
-                    }
-                } else if let message = SoundMuxSessionMessage.decode(data) {
-                    self.handleSession(message, from: peer)
-                }
+                self.process(data, from: peer)
             }
             if error == nil {
                 self.receiveNext(on: connection)
             } else {
                 self.remove(connection)
             }
+        }
+    }
+
+    private func process(_ data: Data, from peer: ReceiverPeer) {
+        peer.lastSeen = DispatchTime.now().uptimeNanoseconds
+        // HELLO is intentionally plaintext. Accept retransmissions even after
+        // authorization so a dropped WELCOME cannot strand the handshake.
+        if let message = SoundMuxSessionMessage.decode(data), message.kind == .hello {
+            handleSession(message, from: peer)
+            return
+        }
+        if peer.authorized {
+            guard case .plaintext(let plaintext) = peer.inboundCipher?.open(data) else {
+                return
+            }
+            if let message = SoundMuxSessionMessage.decode(plaintext) {
+                handleSession(message, from: peer)
+            } else {
+                ingestAudio(plaintext)
+            }
+        } else if let message = SoundMuxSessionMessage.decode(data) {
+            handleSession(message, from: peer)
         }
     }
 
@@ -940,11 +1051,11 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
                   let clientNonceText = message.fields["client_nonce"],
                   let clientNonce = Data.soundMuxHex(
                       clientNonceText, count: soundMuxCryptoNonceBytes),
-                  let replyText = message.fields["reply_port"],
-                  let replyPort = UInt16(replyText), replyPort > 0,
                   let deviceKey else {
                 return
             }
+            let replyPort = message.fields["reply_port"].flatMap(UInt16.init) ?? 0
+            guard peer.isRelay || replyPort > 0 else { return }
             peer.senderID = senderID
             peer.senderName = senderName
             peer.platform = message.fields["platform"] ?? "unknown"
@@ -973,7 +1084,7 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
             }
             peer.inboundCipher = inbound
             peer.outboundCipher = outbound
-            connectControls(for: peer, port: replyPort)
+            if !peer.isRelay { connectControls(for: peer, port: replyPort) }
             let pairRequested = message.fields["pair_requested"] == "1"
             if trustedSenders[senderID] == publicKeyText, !pairRequested {
                 authorize(peer, secrets: secrets)
@@ -1014,13 +1125,30 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
             ))
         case .ping:
             guard peer.authorized else { return }
+            let stats = receiverLock.withLock {
+                MPReceiverEngineSnapshot(receiver)
+            }
             sendSecureControl(
                 .init(kind: .pong, fields: [
                     "receiver_id": receiverID,
                     "counter": message.fields["counter"] ?? "0",
+                    "received": String(stats.packets_received),
+                    "lost": String(stats.packets_lost),
+                    "recovered": String(stats.fec_recovered),
+                    "underruns": String(stats.audio_underruns),
+                    "buffered_frames": String(stats.buffered_frames),
                 ]),
                 to: peer
             )
+        case .profile:
+            guard peer.authorized,
+                  let latencyText = message.fields["latency_ms"],
+                  let latency = UInt32(latencyText),
+                  (20...250).contains(latency) else { return }
+            let changed = receiverLock.withLock {
+                MPReceiverEngineSetTargetLatency(receiver, latency)
+            }
+            if changed { publish(state: "Buffering") }
         case .pairRequired, .rejected, .welcome, .pong:
             break
         }
@@ -1080,16 +1208,25 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
     }
 
     private func sendControl(_ message: SoundMuxSessionMessage, to peer: ReceiverPeer) {
-        peer.controlConnection?.send(
-            content: message.data,
-            completion: .contentProcessed { _ in }
-        )
+        sendDatagram(message.data, to: peer)
     }
 
     private func sendSecureControl(_ message: SoundMuxSessionMessage, to peer: ReceiverPeer) {
         guard let encrypted = peer.outboundCipher?.seal(message.data) else { return }
+        sendDatagram(encrypted, to: peer)
+    }
+
+    private func sendDatagram(_ data: Data, to peer: ReceiverPeer) {
+        if peer.isRelay {
+            guard let relayChannel else { return }
+            data.withUnsafeBytes { bytes in
+                guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
+                _ = MPRelayChannelSend(relayChannel, base, data.count)
+            }
+            return
+        }
         peer.controlConnection?.send(
-            content: encrypted,
+            content: data,
             completion: .contentProcessed { _ in }
         )
     }
@@ -1174,6 +1311,7 @@ private enum ReceiverError: LocalizedError {
     case invalidPort
     case audioFormatUnavailable
     case cryptoUnavailable
+    case relayUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -1181,6 +1319,7 @@ private enum ReceiverError: LocalizedError {
         case .invalidPort: "The UDP listen port is invalid."
         case .audioFormatUnavailable: "The 48 kHz stereo playback format is unavailable."
         case .cryptoUnavailable: "Could not create or load this device's secure identity."
+        case .relayUnavailable: "The internet relay could not be reached."
         }
     }
 }

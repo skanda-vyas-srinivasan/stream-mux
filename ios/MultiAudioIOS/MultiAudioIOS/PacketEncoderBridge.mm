@@ -3,6 +3,7 @@
 #include "multipoint/audio/spsc_audio_ring.h"
 #include "multipoint/protocol/audio_packet.h"
 #include "multipoint/protocol/session_crypto.h"
+#include "multipoint/network/relay_channel.h"
 #include "multipoint/network/udp_socket.h"
 #include "multipoint/transport/receiver_engine.h"
 #include "multipoint/transport/sender_engine.h"
@@ -119,6 +120,21 @@ public:
         playout_active_.store(false, std::memory_order_release);
     }
 
+    void set_target_latency(std::uint32_t latency_ms) {
+        const auto frames = std::clamp<std::size_t>(
+            static_cast<std::size_t>(latency_ms) * 48,
+            multipoint::protocol::kFramesPerPacket,
+            12'000);
+        const auto packets = std::clamp<std::size_t>(
+            frames / multipoint::protocol::kFramesPerPacket, 1, 50);
+        std::lock_guard lock(pump_mutex_);
+        prebuffer_frames_ = frames;
+        ring_.discard();
+        transport_.set_reorder_packets(packets);
+        missing_since_.reset();
+        playout_active_.store(false, std::memory_order_release);
+    }
+
     std::size_t read(float* samples, std::size_t frame_count) {
         if (!playout_active_.load(std::memory_order_acquire)) {
             std::fill(
@@ -152,7 +168,7 @@ public:
 private:
     multipoint::transport::ReceiverEngine transport_;
     multipoint::audio::SpscAudioRing ring_;
-    const std::size_t prebuffer_frames_;
+    std::size_t prebuffer_frames_;
     std::array<float, multipoint::protocol::kSamplesPerPacket> silence_{};
     std::atomic<bool> playout_active_{false};
     std::atomic<std::uint64_t> concealed_packets_{0};
@@ -256,6 +272,18 @@ void MPReceiverEngineRebuffer(MPReceiverEngineRef receiver) {
     static_cast<IOSReceiverEngine*>(receiver)->rebuffer();
 }
 
+bool MPReceiverEngineSetTargetLatency(
+    MPReceiverEngineRef receiver,
+    uint32_t latency_ms) {
+    if (!receiver || latency_ms < 20 || latency_ms > 250) return false;
+    try {
+        static_cast<IOSReceiverEngine*>(receiver)->set_target_latency(latency_ms);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 size_t MPReceiverEngineRead(
     MPReceiverEngineRef receiver,
     float* interleaved_samples,
@@ -301,6 +329,82 @@ bool MPUdpSenderSend(MPUdpSenderRef sender, const uint8_t* bytes, size_t size) {
 
 void MPUdpSenderDestroy(MPUdpSenderRef sender) {
     delete static_cast<multipoint::network::UdpSender*>(sender);
+}
+
+MPRelayChannelRef MPRelayChannelCreate(
+    const char* host,
+    uint16_t port,
+    const char* route_hex,
+    int role) {
+    if (!host || !route_hex || port == 0) return nullptr;
+    multipoint::network::RelayRoute route{};
+    if (!multipoint::network::parse_relay_route(route_hex, route)) return nullptr;
+    if (role != MPRelayRoleSender && role != MPRelayRoleReceiver) return nullptr;
+    const auto relay_role = role == MPRelayRoleSender
+        ? multipoint::network::RelayRole::sender
+        : multipoint::network::RelayRole::receiver;
+    try {
+        return new multipoint::network::RelayChannel(
+            host, port, 0, route, relay_role);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+bool MPRelayChannelAnnounce(MPRelayChannelRef channel) {
+    if (!channel) return false;
+    try {
+        static_cast<multipoint::network::RelayChannel*>(channel)->announce();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool MPRelayChannelKeepalive(MPRelayChannelRef channel) {
+    if (!channel) return false;
+    try {
+        static_cast<multipoint::network::RelayChannel*>(channel)->keepalive();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool MPRelayChannelSend(
+    MPRelayChannelRef channel,
+    const uint8_t* bytes,
+    size_t size) {
+    if (!channel || !bytes || size == 0) return false;
+    try {
+        static_cast<multipoint::network::RelayChannel*>(channel)->send(
+            std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(bytes), size));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool MPRelayChannelReceive(
+    MPRelayChannelRef channel,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* output_size) {
+    if (!channel || !output || output_capacity == 0 || !output_size) return false;
+    try {
+        *output_size = static_cast<multipoint::network::RelayChannel*>(channel)->receive(
+            std::span<std::byte>(
+                reinterpret_cast<std::byte*>(output), output_capacity));
+        return true;
+    } catch (...) {
+        *output_size = 0;
+        return false;
+    }
+}
+
+void MPRelayChannelDestroy(MPRelayChannelRef channel) {
+    delete static_cast<multipoint::network::RelayChannel*>(channel);
 }
 
 bool MPCryptoGenerateDeviceKey(uint8_t* secret_key, uint8_t* public_key) {

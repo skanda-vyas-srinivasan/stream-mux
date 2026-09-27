@@ -1,5 +1,6 @@
 #include "multipoint/network/relay_envelope.h"
 #include "multipoint/network/udp_socket.h"
+#include "multipoint/protocol/session_crypto.h"
 
 #include <array>
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace {
 
@@ -49,8 +51,17 @@ std::uint16_t parse_port(const char* text) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--generate-route") {
+            multipoint::network::RelayRoute route{};
+            if (!multipoint::protocol::secure_random(route)) {
+                throw std::runtime_error("generate relay route");
+            }
+            std::cout << multipoint::network::relay_route_text(route) << '\n';
+            return EXIT_SUCCESS;
+        }
         if (argc > 2) {
-            std::cerr << "Usage: soundmux_relay [udp-port]\n";
+            std::cerr << "Usage: soundmux_relay [udp-port]\n"
+                         "       soundmux_relay --generate-route\n";
             return EXIT_FAILURE;
         }
         const auto port = argc == 2

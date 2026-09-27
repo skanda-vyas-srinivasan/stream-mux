@@ -22,6 +22,8 @@
 		AA000001000000000000020D /* jitter_buffer.cpp in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000111 /* jitter_buffer.cpp */; };
 		AA000001000000000000020E /* session_crypto.cpp in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000112 /* session_crypto.cpp */; };
 		AA000001000000000000020F /* monocypher.c in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000113 /* monocypher.c */; };
+		AA0000010000000000000210 /* relay_envelope.cpp in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000114 /* relay_envelope.cpp */; };
+		AA0000010000000000000211 /* relay_channel.cpp in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000115 /* relay_channel.cpp */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -44,6 +46,8 @@
 		AA0000010000000000000111 /* jitter_buffer.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = jitter_buffer.cpp; path = ../../core/jitter/jitter_buffer.cpp; sourceTree = SOURCE_ROOT; };
 		AA0000010000000000000112 /* session_crypto.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = session_crypto.cpp; path = ../../core/protocol/session_crypto.cpp; sourceTree = SOURCE_ROOT; };
 		AA0000010000000000000113 /* monocypher.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; name = monocypher.c; path = ../../third_party/monocypher/monocypher.c; sourceTree = SOURCE_ROOT; };
+		AA0000010000000000000114 /* relay_envelope.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = relay_envelope.cpp; path = ../../core/network/relay_envelope.cpp; sourceTree = SOURCE_ROOT; };
+		AA0000010000000000000115 /* relay_channel.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = relay_channel.cpp; path = ../../core/network/relay_channel.cpp; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -92,6 +96,8 @@
 				AA0000010000000000000111 /* jitter_buffer.cpp */,
 				AA0000010000000000000112 /* session_crypto.cpp */,
 				AA0000010000000000000113 /* monocypher.c */,
+				AA0000010000000000000114 /* relay_envelope.cpp */,
+				AA0000010000000000000115 /* relay_channel.cpp */,
 				AA0000010000000000000104 /* Info.plist */,
 				AA0000010000000000000105 /* MultiAudioIOS.entitlements */,
 			);
@@ -181,6 +187,8 @@
 				AA000001000000000000020D /* jitter_buffer.cpp in Sources */,
 				AA000001000000000000020E /* session_crypto.cpp in Sources */,
 				AA000001000000000000020F /* monocypher.c in Sources */,
+				AA0000010000000000000210 /* relay_envelope.cpp in Sources */,
+				AA0000010000000000000211 /* relay_channel.cpp in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

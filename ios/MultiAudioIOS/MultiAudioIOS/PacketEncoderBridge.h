@@ -71,6 +71,9 @@ void MPReceiverEnginePump(MPReceiverEngineRef receiver);
 // Discards queued audio/jitter and waits for a fresh prebuffer. Use after an
 // audio-session interruption so stale audio is not replayed.
 void MPReceiverEngineRebuffer(MPReceiverEngineRef receiver);
+bool MPReceiverEngineSetTargetLatency(
+    MPReceiverEngineRef receiver,
+    uint32_t latency_ms);
 // Real-time-safe single-consumer read. Missing frames are zero-filled.
 size_t MPReceiverEngineRead(
     MPReceiverEngineRef receiver,
@@ -84,6 +87,33 @@ typedef void* MPUdpSenderRef;
 MPUdpSenderRef MPUdpSenderCreate(const char* host, uint16_t port);
 bool MPUdpSenderSend(MPUdpSenderRef sender, const uint8_t* bytes, size_t size);
 void MPUdpSenderDestroy(MPUdpSenderRef sender);
+
+typedef void* MPRelayChannelRef;
+
+enum {
+    MPRelayRoleSender = 1,
+    MPRelayRoleReceiver = 2,
+};
+
+// The route is a 32-character hexadecimal bearer capability. A relay channel
+// uses one bound UDP socket for registration, payloads, and replies.
+MPRelayChannelRef MPRelayChannelCreate(
+    const char* host,
+    uint16_t port,
+    const char* route_hex,
+    int role);
+bool MPRelayChannelAnnounce(MPRelayChannelRef channel);
+bool MPRelayChannelKeepalive(MPRelayChannelRef channel);
+bool MPRelayChannelSend(
+    MPRelayChannelRef channel,
+    const uint8_t* bytes,
+    size_t size);
+bool MPRelayChannelReceive(
+    MPRelayChannelRef channel,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* output_size);
+void MPRelayChannelDestroy(MPRelayChannelRef channel);
 
 typedef void* MPSessionCipherRef;
 

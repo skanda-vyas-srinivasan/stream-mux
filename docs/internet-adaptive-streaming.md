@@ -11,10 +11,12 @@ pieces of the internet path:
 - a portable bidirectional relay channel that keeps registration, keepalives,
   audio datagrams, and replies on one UDP socket so the same NAT mapping is
   used in both directions;
+- Mac sender and iPhone receiver integration, with an explicit internet-relay
+  mode and a shared private route code;
 - relay framing validation and size limits that keep existing audio datagrams
   below the normal network MTU;
-- an adaptive controller that observes packet loss, arrival gaps, round-trip
-  time, and audio underruns; and
+- authenticated receiver-health feedback plus an adaptive controller that
+  observes packet loss, round-trip time, and audio underruns;
 - hysteresis and cooldown behavior so a single bad interval cannot make the
   stream oscillate between profiles.
 
@@ -22,12 +24,34 @@ The relay payload is the existing SoundMux session or encrypted `SME1`
 datagram. Pairing, device-key verification, authenticated encryption, and
 replay protection remain end to end; the relay is not trusted with audio keys.
 
-This checkpoint is not yet an app-usable internet route. A loopback integration
-test proves opaque payload delivery in both directions through the relay, but
-the Mac, iPhone, and Windows adapters still need to use the relay channel. They
-also need keepalive scheduling, route invitation UI, and fallback integration
-with the connection planner. The adaptive decision needs protocol negotiation
-before it can safely change live receiver buffering or FEC parameters.
+The Mac sender and iPhone receiver can now use a manually configured relay. A
+loopback integration test proves bidirectional delivery of session handshakes
+and authenticated encrypted payloads, and both platform targets compile with
+the relay path. A public relay has not been deployed or physically validated
+across two networks yet. Windows, route
+invitations, automatic direct-to-relay fallback, compression, and production
+relay abuse controls remain future work.
+
+Adaptive latency is enabled for internet-relay sessions. Profile messages are
+authenticated inside the end-to-end encrypted session and the receiver applies
+them at an explicit rebuffer boundary. FEC remains at the protocol's fixed
+10+5 layout; the controller must not change parity until a future protocol
+version negotiates that change safely.
+
+## Manual test setup
+
+Build the project, generate a private route, and run the relay on a host whose
+UDP port is reachable from both devices:
+
+```sh
+./build/core/soundmux_relay --generate-route
+./build/core/soundmux_relay 48200
+```
+
+On the iPhone, enable **Internet relay**, enter the relay host, UDP port, and
+generated 32-character route code, then restart the receiver. On the Mac,
+enable **Connect through an internet relay**, enter the same values, and
+connect. Treat the route code like a password.
 
 ## Adaptive profiles
 
@@ -54,17 +78,15 @@ UDP amplification.
 
 ## Remaining milestones
 
-1. Integrate the portable relay channel with the Mac, iPhone, and Windows
-   sender/receiver adapters, including keepalive scheduling.
-2. Extend the automated relay test from bidirectional opaque payload delivery
-   to a complete authenticated sender/receiver session.
-3. Add receiver feedback fields for loss, jitter, buffered duration, and
-   underruns to authenticated heartbeat replies.
-4. Negotiate adaptive profile changes and apply them at safe rebuffer/FEC group
-   boundaries.
-5. Add route-invitation creation and acceptance to the Mac and iPhone apps.
-6. Deploy a rate-limited relay on a public test host and perform a real
+1. Integrate the portable relay channel with Windows and the remaining
+   sender/receiver directions.
+2. Add interval arrival-gap feedback and expose adaptive profile history in
+   connection diagnostics.
+3. Negotiate variable FEC in a future protocol version and apply changes only
+   at an agreed group boundary.
+4. Add route-invitation creation and acceptance to the Mac and iPhone apps.
+5. Deploy a rate-limited relay on a public test host and perform a real
    cross-network listening test.
-7. Evaluate Opus before mobile-data use. The current stereo PCM plus FEC path is
+6. Evaluate Opus before mobile-data use. The current stereo PCM plus FEC path is
    appropriate for validation but consumes substantially more bandwidth than a
    compressed internet mode.

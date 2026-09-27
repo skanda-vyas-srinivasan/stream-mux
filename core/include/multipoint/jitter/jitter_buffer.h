@@ -39,6 +39,7 @@ public:
     [[nodiscard]] const JitterStats& stats() const { return stats_; }
     std::size_t discard_oldest_until(std::size_t target_depth);
     bool advance_to_oldest_available();
+    void set_target_packets(std::size_t target_packets);
     void rebuffer();
     void reset();
 

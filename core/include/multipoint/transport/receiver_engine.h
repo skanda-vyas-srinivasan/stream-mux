@@ -58,6 +58,7 @@ public:
     [[nodiscard]] jitter::PopResult pop(bool declare_missing = true);
     [[nodiscard]] std::size_t discard_oldest_until(std::size_t target_depth);
     [[nodiscard]] bool advance_to_oldest_available();
+    void set_reorder_packets(std::size_t target_packets);
     void rebuffer();
     void reset();
 

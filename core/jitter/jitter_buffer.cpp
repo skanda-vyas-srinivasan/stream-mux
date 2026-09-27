@@ -115,6 +115,15 @@ bool JitterBuffer::advance_to_oldest_available() {
     return true;
 }
 
+void JitterBuffer::set_target_packets(std::size_t target_packets) {
+    if (target_packets == 0 || target_packets > capacity_packets_) {
+        throw std::invalid_argument("invalid jitter buffer target");
+    }
+    if (target_packets_ == target_packets) return;
+    target_packets_ = target_packets;
+    rebuffer();
+}
+
 void JitterBuffer::reset() {
     packets_.clear();
     stats_ = {};

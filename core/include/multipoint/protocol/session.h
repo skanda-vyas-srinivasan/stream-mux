@@ -19,6 +19,7 @@ enum class SessionMessageType {
     welcome,
     ping,
     pong,
+    profile,
 };
 
 struct SessionMessage {

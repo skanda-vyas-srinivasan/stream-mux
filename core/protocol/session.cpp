@@ -76,6 +76,7 @@ std::optional<SessionMessageType> parse_type(std::string_view value) {
     if (value == "WELCOME") return SessionMessageType::welcome;
     if (value == "PING") return SessionMessageType::ping;
     if (value == "PONG") return SessionMessageType::pong;
+    if (value == "PROFILE") return SessionMessageType::profile;
     return std::nullopt;
 }
 
@@ -98,6 +99,7 @@ std::string_view session_message_name(SessionMessageType type) {
         case SessionMessageType::welcome: return "WELCOME";
         case SessionMessageType::ping: return "PING";
         case SessionMessageType::pong: return "PONG";
+        case SessionMessageType::profile: return "PROFILE";
     }
     throw std::invalid_argument("unknown session message type");
 }

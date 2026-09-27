@@ -1,9 +1,11 @@
 #include "multipoint/audio/spsc_audio_ring.h"
 #include "multipoint/clock/monotonic_clock.h"
+#include "multipoint/network/relay_channel.h"
 #include "multipoint/network/udp_socket.h"
 #include "multipoint/protocol/audio_packet.h"
 #include "multipoint/protocol/session.h"
 #include "multipoint/protocol/session_crypto.h"
+#include "multipoint/transport/adaptive_controller.h"
 #include "multipoint/transport/sender_engine.h"
 #include "receiver_runtime.h"
 #include "stereo_sample_rate_converter.h"
@@ -41,6 +43,71 @@ constexpr std::size_t kCaptureRingFrames = 48'000;
 constexpr std::size_t kMaximumIOFrames = 8'192;
 volatile std::sig_atomic_t g_running = 1;
 
+struct RelayConfiguration {
+    std::string host;
+    std::uint16_t port = 0;
+    multipoint::network::RelayRoute route{};
+};
+
+std::uint16_t control_port_for(std::uint16_t audio_port);
+
+class SenderNetworkPath {
+public:
+    virtual ~SenderNetworkPath() = default;
+    virtual void send(std::span<const std::byte> datagram) = 0;
+    virtual std::size_t receive(std::span<std::byte> datagram) = 0;
+    [[nodiscard]] virtual std::uint16_t reply_port() const = 0;
+};
+
+class DirectSenderNetworkPath final : public SenderNetworkPath {
+public:
+    DirectSenderNetworkPath(const std::string& host, std::uint16_t port)
+        : sender_(host, port), receiver_(control_port_for(port)) {}
+
+    void send(std::span<const std::byte> datagram) override {
+        sender_.send(datagram);
+    }
+    std::size_t receive(std::span<std::byte> datagram) override {
+        return receiver_.receive(datagram);
+    }
+    [[nodiscard]] std::uint16_t reply_port() const override {
+        return receiver_.local_port();
+    }
+
+private:
+    multipoint::network::UdpSender sender_;
+    multipoint::network::UdpReceiver receiver_;
+};
+
+class RelaySenderNetworkPath final : public SenderNetworkPath {
+public:
+    explicit RelaySenderNetworkPath(const RelayConfiguration& config)
+        : channel_(
+              config.host, config.port, 0, config.route,
+              multipoint::network::RelayRole::sender) {
+        channel_.announce();
+    }
+
+    void send(std::span<const std::byte> datagram) override {
+        channel_.send(datagram);
+    }
+    std::size_t receive(std::span<std::byte> datagram) override {
+        return channel_.receive(datagram);
+    }
+    [[nodiscard]] std::uint16_t reply_port() const override { return 0; }
+
+private:
+    multipoint::network::RelayChannel channel_;
+};
+
+std::unique_ptr<SenderNetworkPath> make_sender_network_path(
+    const std::string& host,
+    std::uint16_t port,
+    const std::optional<RelayConfiguration>& relay) {
+    if (relay) return std::make_unique<RelaySenderNetworkPath>(*relay);
+    return std::make_unique<DirectSenderNetworkPath>(host, port);
+}
+
 struct SenderSnapshot {
     std::uint64_t capture_callbacks = 0;
     std::uint64_t capture_frames = 0;
@@ -54,6 +121,8 @@ struct SenderSnapshot {
     bool media_control_access = false;
     bool receiver_alive = false;
     std::uint64_t heartbeat_age_ms = 0;
+    std::uint32_t target_latency_ms = 0;
+    std::uint64_t round_trip_ms = 0;
 };
 
 void handle_signal(int) { g_running = 0; }
@@ -319,14 +388,17 @@ public:
         std::string device_id,
         std::string device_name,
         std::string expected_receiver_id,
+        std::optional<RelayConfiguration> relay = std::nullopt,
         std::function<void(const std::string&)> state_handler = {},
         std::function<bool(const std::string&, const std::string&)>
             pairing_confirmation = {},
         std::function<bool()> cancellation_handler = {})
-        : udp_(host, port),
-          control_receiver_(std::make_unique<multipoint::network::UdpReceiver>(
-              control_port_for(port))),
+        : network_(make_sender_network_path(host, port, relay)),
           sender_(multipoint::clock::monotonic_time_ns()),
+          adaptive_enabled_(relay.has_value()),
+          adaptive_controller_(relay
+              ? multipoint::transport::AdaptiveProfile::balanced
+              : multipoint::transport::AdaptiveProfile::responsive),
           audio_ring_(kCaptureRingFrames, multipoint::protocol::kChannelCount),
           device_id_(std::move(device_id)),
           device_name_(std::move(device_name)),
@@ -335,8 +407,18 @@ public:
           state_handler_(std::move(state_handler)),
           pairing_confirmation_(std::move(pairing_confirmation)),
           cancellation_handler_(std::move(cancellation_handler)),
-          control_port_(control_port_for(port)) {
+          control_port_(network_->reply_port()) {
+        if (adaptive_enabled_) {
+            adaptive_latency_ms_.store(
+                adaptive_controller_.decision().target_latency_ms,
+                std::memory_order_relaxed);
+        }
         perform_handshake();
+        if (adaptive_enabled_) {
+            requested_latency_ms_.store(
+                adaptive_controller_.decision().target_latency_ms,
+                std::memory_order_relaxed);
+        }
         try {
             create_tap();
             converter_ = std::make_unique<multipoint::macos::StereoSampleRateConverter>(
@@ -408,6 +490,8 @@ public:
             .media_control_access = request_media_control_access(false),
             .receiver_alive = last_pong != 0 && age_ms < 4'000,
             .heartbeat_age_ms = age_ms,
+            .target_latency_ms = adaptive_latency_ms_.load(std::memory_order_relaxed),
+            .round_trip_ms = round_trip_ms_.load(std::memory_order_relaxed),
         };
     }
 
@@ -423,7 +507,9 @@ public:
                   << " control_failures=" << stats.control_failures
                   << " ring_frames=" << stats.ring_frames
                   << " receiver_alive=" << stats.receiver_alive
-                  << " heartbeat_age_ms=" << stats.heartbeat_age_ms << '\n';
+                  << " heartbeat_age_ms=" << stats.heartbeat_age_ms
+                  << " target_latency_ms=" << stats.target_latency_ms
+                  << " round_trip_ms=" << stats.round_trip_ms << '\n';
     }
 
     [[nodiscard]] const AudioStreamBasicDescription& format() const {
@@ -469,10 +555,10 @@ private:
             }
             const auto now = std::chrono::steady_clock::now();
             if (now >= next_hello) {
-                udp_.send(hello);
+                network_->send(hello);
                 next_hello = now + std::chrono::seconds(1);
             }
-            const auto size = control_receiver_->receive(reply);
+            const auto size = network_->receive(reply);
             if (size == 0) continue;
             const auto decoded = multipoint::protocol::deserialize_session(
                 std::span<const std::byte>(reply.data(), size));
@@ -603,7 +689,21 @@ private:
                 {"reply_port", std::to_string(control_port_)},
             },
         });
-        udp_.send(outbound_cipher_->encrypt(plaintext));
+        last_ping_sent_ns_.store(
+            multipoint::clock::monotonic_time_ns(), std::memory_order_relaxed);
+        last_ping_counter_.store(counter, std::memory_order_relaxed);
+        network_->send(outbound_cipher_->encrypt(plaintext));
+    }
+
+    void send_profile(std::uint32_t latency_ms) {
+        if (!outbound_cipher_) throw std::runtime_error("secure session unavailable");
+        const auto plaintext = multipoint::protocol::serialize_session({
+            .type = multipoint::protocol::SessionMessageType::profile,
+            .fields = {
+                {"latency_ms", std::to_string(latency_ms)},
+            },
+        });
+        network_->send(outbound_cipher_->encrypt(plaintext));
     }
 
     void create_tap() {
@@ -719,6 +819,16 @@ private:
                 }
                 next_heartbeat = now + std::chrono::seconds(1);
             }
+            if (const auto latency = requested_latency_ms_.exchange(
+                    0, std::memory_order_acq_rel); latency != 0) {
+                try {
+                    send_profile(latency);
+                } catch (const std::exception& error) {
+                    requested_latency_ms_.store(latency, std::memory_order_release);
+                    send_failures_.fetch_add(1, std::memory_order_relaxed);
+                    std::cerr << "adaptive profile send error: " << error.what() << '\n';
+                }
+            }
             try {
                 const auto frames = converter_->read(packet_samples);
                 if (frames == 0) {
@@ -736,7 +846,7 @@ private:
                     throw std::runtime_error("secure session unavailable");
                 }
                 for (const auto& datagram : datagrams) {
-                    udp_.send(outbound_cipher_->encrypt(datagram));
+                    network_->send(outbound_cipher_->encrypt(datagram));
                 }
             } catch (const std::exception& error) {
                 const auto failures =
@@ -755,7 +865,7 @@ private:
                 multipoint::protocol::kEncryptedOverheadBytes> datagram{};
         while (running_.load(std::memory_order_acquire)) {
             try {
-                const auto size = control_receiver_->receive(datagram);
+                const auto size = network_->receive(datagram);
                 if (size == 0) continue;
                 if (!inbound_cipher_) continue;
                 auto opened = inbound_cipher_->decrypt(
@@ -766,9 +876,64 @@ private:
                 if (session.valid &&
                     session.message.type ==
                         multipoint::protocol::SessionMessageType::pong) {
-                    last_pong_ns_.store(
-                        multipoint::clock::monotonic_time_ns(),
+                    const auto now_ns = multipoint::clock::monotonic_time_ns();
+                    last_pong_ns_.store(now_ns, std::memory_order_relaxed);
+                    const auto number = [&](const char* key)
+                        -> std::optional<std::uint64_t> {
+                        const auto found = session.message.fields.find(key);
+                        if (found == session.message.fields.end()) return std::nullopt;
+                        try {
+                            std::size_t used = 0;
+                            const auto value = std::stoull(found->second, &used);
+                            if (used != found->second.size()) return std::nullopt;
+                            return value;
+                        } catch (...) {
+                            return std::nullopt;
+                        }
+                    };
+                    double rtt_ms = static_cast<double>(
+                        round_trip_ms_.load(std::memory_order_relaxed));
+                    const auto pong_counter = number("counter");
+                    const auto ping_counter = last_ping_counter_.load(
                         std::memory_order_relaxed);
+                    const auto ping_ns = last_ping_sent_ns_.load(
+                        std::memory_order_relaxed);
+                    if (pong_counter && *pong_counter == ping_counter &&
+                        ping_ns != 0 && now_ns >= ping_ns) {
+                        rtt_ms = static_cast<double>(now_ns - ping_ns) / 1'000'000.0;
+                        round_trip_ms_.store(
+                            static_cast<std::uint64_t>(rtt_ms),
+                            std::memory_order_relaxed);
+                    }
+                    const auto received = number("received");
+                    const auto lost = number("lost");
+                    const auto underruns = number("underruns");
+                    if (adaptive_enabled_ && received && lost && underruns) {
+                        if (receiver_metrics_initialized_ &&
+                            *received >= last_receiver_packets_ &&
+                            *lost >= last_receiver_lost_ &&
+                            *underruns >= last_receiver_underruns_) {
+                            const auto decision = adaptive_controller_.observe({
+                                .packets_received = *received - last_receiver_packets_,
+                                .packets_lost = *lost - last_receiver_lost_,
+                                .audio_underruns = *underruns - last_receiver_underruns_,
+                                .maximum_arrival_gap_ms = 0,
+                                .round_trip_ms = rtt_ms,
+                            });
+                            if (decision.changed) {
+                                adaptive_latency_ms_.store(
+                                    decision.target_latency_ms,
+                                    std::memory_order_relaxed);
+                                requested_latency_ms_.store(
+                                    decision.target_latency_ms,
+                                    std::memory_order_release);
+                            }
+                        }
+                        last_receiver_packets_ = *received;
+                        last_receiver_lost_ = *lost;
+                        last_receiver_underruns_ = *underruns;
+                        receiver_metrics_initialized_ = true;
+                    }
                     continue;
                 }
                 const std::string_view command(
@@ -801,9 +966,10 @@ private:
         }
     }
 
-    multipoint::network::UdpSender udp_;
-    std::unique_ptr<multipoint::network::UdpReceiver> control_receiver_;
+    std::unique_ptr<SenderNetworkPath> network_;
     multipoint::transport::SenderEngine sender_;
+    const bool adaptive_enabled_;
+    multipoint::transport::AdaptiveController adaptive_controller_;
     multipoint::audio::SpscAudioRing audio_ring_;
     std::unique_ptr<multipoint::macos::StereoSampleRateConverter> converter_;
     std::array<float, kMaximumIOFrames * multipoint::protocol::kChannelCount>
@@ -837,6 +1003,15 @@ private:
     std::atomic<std::uint64_t> control_failures_{0};
     std::atomic<std::uint64_t> last_pong_ns_{0};
     std::atomic<std::uint64_t> heartbeat_counter_{0};
+    std::atomic<std::uint64_t> last_ping_sent_ns_{0};
+    std::atomic<std::uint64_t> last_ping_counter_{0};
+    std::atomic<std::uint64_t> round_trip_ms_{0};
+    std::atomic<std::uint32_t> adaptive_latency_ms_{0};
+    std::atomic<std::uint32_t> requested_latency_ms_{0};
+    std::uint64_t last_receiver_packets_ = 0;
+    std::uint64_t last_receiver_lost_ = 0;
+    std::uint64_t last_receiver_underruns_ = 0;
+    bool receiver_metrics_initialized_ = false;
 };
 
 }  // namespace
@@ -859,6 +1034,11 @@ private:
     NSStackView* _manualStack;
     NSTextField* _hostField;
     NSTextField* _portField;
+    NSButton* _internetRelayButton;
+    NSStackView* _relayStack;
+    NSTextField* _relayHostField;
+    NSTextField* _relayPortField;
+    NSSecureTextField* _relayRouteField;
     NSTextField* _statusLabel;
     NSTextField* _metricsLabel;
     NSTextField* _mediaControlLabel;
@@ -892,7 +1072,7 @@ private:
 - (void)applicationDidFinishLaunching:(NSNotification*)notification {
     (void)notification;
     _window = [[NSWindow alloc]
-        initWithContentRect:NSMakeRect(0, 0, 520, 650)
+        initWithContentRect:NSMakeRect(0, 0, 520, 720)
                   styleMask:NSWindowStyleMaskTitled |
                             NSWindowStyleMaskClosable |
                             NSWindowStyleMaskMiniaturizable
@@ -1045,9 +1225,67 @@ private:
     _manualStack.alignment = NSLayoutAttributeBottom;
     _manualStack.spacing = 10;
 
+    _internetRelayButton = [NSButton checkboxWithTitle:
+        @"Connect through an internet relay"
+                                                     target:self
+                                                     action:@selector(relayModeChanged:)];
+    _internetRelayButton.font = [NSFont systemFontOfSize:12];
+    _internetRelayButton.state = [defaults boolForKey:@"useInternetRelay"]
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    _relayHostField = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    _relayHostField.placeholderString = @"relay.example.com";
+    NSString* saved_relay_host = [defaults stringForKey:@"relayHost"];
+    _relayHostField.stringValue = saved_relay_host ? saved_relay_host : @"";
+    _relayPortField = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    _relayPortField.placeholderString = @"48200";
+    NSString* saved_relay_port = [defaults stringForKey:@"relayPort"];
+    _relayPortField.stringValue = saved_relay_port ? saved_relay_port : @"48200";
+    _relayRouteField = [[NSSecureTextField alloc] initWithFrame:NSZeroRect];
+    _relayRouteField.placeholderString = @"32-character route code";
+    NSString* saved_relay_route = [defaults stringForKey:@"relayRoute"];
+    _relayRouteField.stringValue = saved_relay_route ? saved_relay_route : @"";
+    NSTextField* relay_host_label = [NSTextField labelWithString:@"Relay host"];
+    NSTextField* relay_port_label = [NSTextField labelWithString:@"Port"];
+    NSTextField* relay_route_label = [NSTextField labelWithString:@"Private route code"];
+    for (NSTextField* label in @[relay_host_label, relay_port_label, relay_route_label]) {
+        label.font = [NSFont systemFontOfSize:11];
+        label.textColor = NSColor.secondaryLabelColor;
+    }
+    NSStackView* relay_host_column = [NSStackView stackViewWithViews:@[
+        relay_host_label, _relayHostField,
+    ]];
+    relay_host_column.orientation = NSUserInterfaceLayoutOrientationVertical;
+    relay_host_column.alignment = NSLayoutAttributeLeading;
+    relay_host_column.spacing = 4;
+    NSStackView* relay_port_column = [NSStackView stackViewWithViews:@[
+        relay_port_label, _relayPortField,
+    ]];
+    relay_port_column.orientation = NSUserInterfaceLayoutOrientationVertical;
+    relay_port_column.alignment = NSLayoutAttributeLeading;
+    relay_port_column.spacing = 4;
+    NSStackView* relay_address_row = [NSStackView stackViewWithViews:@[
+        relay_host_column, relay_port_column,
+    ]];
+    relay_address_row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    relay_address_row.alignment = NSLayoutAttributeBottom;
+    relay_address_row.spacing = 10;
+    NSStackView* relay_route_column = [NSStackView stackViewWithViews:@[
+        relay_route_label, _relayRouteField,
+    ]];
+    relay_route_column.orientation = NSUserInterfaceLayoutOrientationVertical;
+    relay_route_column.alignment = NSLayoutAttributeLeading;
+    relay_route_column.spacing = 4;
+    _relayStack = [NSStackView stackViewWithViews:@[
+        relay_address_row, relay_route_column,
+    ]];
+    _relayStack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    _relayStack.alignment = NSLayoutAttributeLeading;
+    _relayStack.spacing = 8;
+    _relayStack.hidden = _internetRelayButton.state != NSControlStateValueOn;
+
     NSStackView* receiver_stack = [NSStackView stackViewWithViews:@[
         receiver_label, _receiverPopup, _discoveryLabel, selected_device_box, _manualStack,
-        _autoReconnectButton,
+        _internetRelayButton, _relayStack, _autoReconnectButton,
     ]];
     receiver_stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     receiver_stack.alignment = NSLayoutAttributeLeading;
@@ -1303,6 +1541,9 @@ private:
         [permission_row.widthAnchor constraintEqualToAnchor:content.widthAnchor],
         [_hostField.widthAnchor constraintEqualToConstant:270],
         [_portField.widthAnchor constraintEqualToConstant:96],
+        [_relayHostField.widthAnchor constraintEqualToConstant:270],
+        [_relayPortField.widthAnchor constraintEqualToConstant:96],
+        [_relayRouteField.widthAnchor constraintEqualToConstant:376],
         [_receiveNameField.widthAnchor constraintEqualToConstant:330],
         [_receivePortField.widthAnchor constraintEqualToConstant:96],
         [identity_row.widthAnchor constraintEqualToAnchor:_receiveView.widthAnchor],
@@ -1654,6 +1895,16 @@ private:
     }
 }
 
+- (void)relayModeChanged:(id)sender {
+    (void)sender;
+    const BOOL enabled = _internetRelayButton.state == NSControlStateValueOn;
+    _relayStack.hidden = !enabled;
+    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:@"useInternetRelay"];
+    _discoveryLabel.stringValue = enabled
+        ? @"Internet mode uses the private route code; audio stays end-to-end encrypted."
+        : @"Nearby receivers use a direct local connection.";
+}
+
 - (void)scheduleAutoReconnectIfPossible {
     if (_sender || _starting || _reconnectScheduled || _manualDisconnect ||
         _autoReconnectButton.state != NSControlStateValueOn) {
@@ -1835,6 +2086,10 @@ private:
         }
         _hostField.enabled = YES;
         _portField.enabled = YES;
+        _internetRelayButton.enabled = YES;
+        _relayHostField.enabled = YES;
+        _relayPortField.enabled = YES;
+        _relayRouteField.enabled = YES;
         _receiverPopup.enabled = YES;
         _startButton.title = @"Connect";
         _startButton.bezelColor = NSColor.systemBlueColor;
@@ -1870,9 +2125,40 @@ private:
         port_number = _portField.integerValue;
         receiver_name = host;
     }
-    if (!host.length || port_number < 1 || port_number > 65'534) {
+    const BOOL use_relay = _internetRelayButton.state == NSControlStateValueOn;
+    std::optional<RelayConfiguration> relay_config;
+    if (use_relay) {
+        NSString* relay_host = [_relayHostField.stringValue
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSString* route_text = [[_relayRouteField.stringValue
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+            lowercaseString];
+        const NSInteger relay_port = _relayPortField.integerValue;
+        multipoint::network::RelayRoute route{};
+        if (!relay_host.length || relay_port < 1 || relay_port > 65'535 ||
+            !multipoint::network::parse_relay_route(route_text.UTF8String, route)) {
+            _statusLabel.stringValue =
+                @"Enter a relay host, UDP port, and 32-character route code.";
+            return;
+        }
+        relay_config = RelayConfiguration{
+            .host = relay_host.UTF8String,
+            .port = static_cast<std::uint16_t>(relay_port),
+            .route = route,
+        };
+        NSUserDefaults* defaults = NSUserDefaults.standardUserDefaults;
+        [defaults setObject:relay_host forKey:@"relayHost"];
+        [defaults setObject:_relayPortField.stringValue forKey:@"relayPort"];
+        [defaults setObject:route_text forKey:@"relayRoute"];
+    }
+    if (!use_relay && (!host.length || port_number < 1 || port_number > 65'534)) {
         _statusLabel.stringValue = @"Enter a valid receiver address and UDP port.";
         return;
+    }
+    if (use_relay && (!host.length || port_number < 1 || port_number > 65'534)) {
+        host = @"relay";
+        port_number = 1;
+        receiver_name = @"internet receiver";
     }
     NSString* previously_saved_host = [NSUserDefaults.standardUserDefaults
         stringForKey:@"receiverHost"];
@@ -1901,6 +2187,10 @@ private:
     const auto cancellation = _startCancellation;
     _hostField.enabled = NO;
     _portField.enabled = NO;
+    _internetRelayButton.enabled = NO;
+    _relayHostField.enabled = NO;
+    _relayPortField.enabled = NO;
+    _relayRouteField.enabled = NO;
     _receiverPopup.enabled = NO;
     _forgetReceiverButton.enabled = NO;
     _startButton.title = @"Cancel";
@@ -1929,6 +2219,7 @@ private:
                 persistent_sender_value(@"soundMuxDeviceID", NO).UTF8String,
                 local_sender_name().UTF8String,
                 expected_receiver_id,
+                relay_config,
                 [self](const std::string& status) {
                     NSString* text = [NSString stringWithUTF8String:status.c_str()];
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1996,6 +2287,10 @@ private:
             if (!new_sender) {
                 self->_hostField.enabled = YES;
                 self->_portField.enabled = YES;
+                self->_internetRelayButton.enabled = YES;
+                self->_relayHostField.enabled = YES;
+                self->_relayPortField.enabled = YES;
+                self->_relayRouteField.enabled = YES;
                 self->_receiverPopup.enabled = YES;
                 self->_startButton.title = @"Connect";
                 self->_startButton.bezelColor = NSColor.systemBlueColor;
@@ -2058,21 +2353,29 @@ private:
         _sender.reset();
         _hostField.enabled = YES;
         _portField.enabled = YES;
+        _internetRelayButton.enabled = YES;
+        _relayHostField.enabled = YES;
+        _relayPortField.enabled = YES;
+        _relayRouteField.enabled = YES;
         _receiverPopup.enabled = YES;
         _startButton.title = @"Connect";
         _startButton.bezelColor = NSColor.systemBlueColor;
         [self scheduleAutoReconnectIfPossible];
         return;
     }
+    NSString* adaptive_status = stats.target_latency_ms == 0
+        ? @"Direct/manual"
+        : [NSString stringWithFormat:@"%u ms", stats.target_latency_ms];
     _metricsLabel.stringValue = [NSString stringWithFormat:
-        @"Audio packets  %llu    •    FEC packets  %llu\nRemote commands  %llu%@    •    Drops / failures  %llu / %llu    •    Last response %llu ms ago",
+        @"Audio packets  %llu    •    FEC packets  %llu    •    Buffer  %@\nRemote commands  %llu%@    •    Drops / failures  %llu / %llu    •    RTT %llu ms",
         stats.audio_packets,
         stats.parity_packets,
+        adaptive_status,
         stats.control_commands,
         stats.media_control_access ? @"" : @" (Accessibility needed)",
         stats.capture_drops,
         stats.send_failures + stats.control_failures,
-        stats.heartbeat_age_ms];
+        stats.round_trip_ms];
 }
 
 @end
@@ -2108,6 +2411,7 @@ int main(int argc, char** argv) {
                 persistent_sender_value(@"soundMuxDeviceID", NO).UTF8String,
                 local_sender_name().UTF8String,
                 "",
+                std::nullopt,
                 [](const std::string& status) { std::cout << status << '\n'; },
                 [](const std::string& code, const std::string& receiver) {
                     std::cout << "Verify " << receiver << " shows code " << code
