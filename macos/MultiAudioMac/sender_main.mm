@@ -311,6 +311,73 @@ Value get_audio_property(
     return value;
 }
 
+NSArray<NSDictionary*>* active_audio_applications() {
+    AudioObjectPropertyAddress address{
+        .mSelector = kAudioHardwarePropertyProcessObjectList,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(
+            kAudioObjectSystemObject, &address, 0, nullptr, &size) != noErr ||
+        size == 0) {
+        return @[];
+    }
+    std::vector<AudioObjectID> process_objects(size / sizeof(AudioObjectID));
+    if (AudioObjectGetPropertyData(
+            kAudioObjectSystemObject, &address, 0, nullptr, &size,
+            process_objects.data()) != noErr) {
+        return @[];
+    }
+
+    NSMutableArray<NSDictionary*>* applications = [NSMutableArray array];
+    NSMutableSet<NSString*>* seen_bundles = [NSMutableSet set];
+    for (const auto object : process_objects) {
+        pid_t pid = 0;
+        UInt32 pid_size = sizeof(pid);
+        AudioObjectPropertyAddress pid_address{
+            .mSelector = kAudioProcessPropertyPID,
+            .mScope = kAudioObjectPropertyScopeGlobal,
+            .mElement = kAudioObjectPropertyElementMain,
+        };
+        if (AudioObjectGetPropertyData(
+                object, &pid_address, 0, nullptr, &pid_size, &pid) != noErr ||
+            pid == NSProcessInfo.processInfo.processIdentifier) {
+            continue;
+        }
+        UInt32 is_running_output = 0;
+        UInt32 running_size = sizeof(is_running_output);
+        AudioObjectPropertyAddress running_address{
+            .mSelector = kAudioProcessPropertyIsRunningOutput,
+            .mScope = kAudioObjectPropertyScopeGlobal,
+            .mElement = kAudioObjectPropertyElementMain,
+        };
+        if (AudioObjectGetPropertyData(
+                object, &running_address, 0, nullptr, &running_size,
+                &is_running_output) != noErr || !is_running_output) {
+            continue;
+        }
+        NSRunningApplication* application = [NSRunningApplication
+            runningApplicationWithProcessIdentifier:pid];
+        NSString* bundle = application.bundleIdentifier;
+        NSString* name = application.localizedName;
+        if (!bundle.length || !name.length || [seen_bundles containsObject:bundle]) {
+            continue;
+        }
+        [seen_bundles addObject:bundle];
+        [applications addObject:@{
+            @"name": name,
+            @"bundle": bundle,
+            @"object": @(object),
+        }];
+    }
+    [applications sortUsingComparator:^NSComparisonResult(
+        NSDictionary* left, NSDictionary* right) {
+        return [left[@"name"] localizedCaseInsensitiveCompare:right[@"name"]];
+    }];
+    return applications;
+}
+
 class CoreAudioTapSender {
 public:
     CoreAudioTapSender(
@@ -319,6 +386,7 @@ public:
         std::string device_id,
         std::string device_name,
         std::string expected_receiver_id,
+        std::vector<AudioObjectID> included_processes = {},
         std::function<void(const std::string&)> state_handler = {},
         std::function<bool(const std::string&, const std::string&)>
             pairing_confirmation = {},
@@ -331,6 +399,7 @@ public:
           device_id_(std::move(device_id)),
           device_name_(std::move(device_name)),
           expected_receiver_id_(std::move(expected_receiver_id)),
+          included_processes_(std::move(included_processes)),
           device_key_(persistent_device_key()),
           state_handler_(std::move(state_handler)),
           pairing_confirmation_(std::move(pairing_confirmation)),
@@ -607,8 +676,13 @@ private:
     }
 
     void create_tap() {
-        CATapDescription* description = [[CATapDescription alloc]
-            initStereoGlobalTapButExcludeProcesses:@[]];
+        NSMutableArray<NSNumber*>* process_objects = [NSMutableArray array];
+        for (const auto object : included_processes_) {
+            [process_objects addObject:@(object)];
+        }
+        CATapDescription* description = included_processes_.empty()
+            ? [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:@[]]
+            : [[CATapDescription alloc] initStereoMixdownOfProcesses:process_objects];
         description.name = @"SoundMux system audio";
         [description setPrivate:YES];
         description.muteBehavior = CATapUnmuted;
@@ -811,6 +885,7 @@ private:
     std::string device_id_;
     std::string device_name_;
     std::string expected_receiver_id_;
+    std::vector<AudioObjectID> included_processes_;
     std::string receiver_name_;
     multipoint::protocol::DeviceKeyPair device_key_;
     std::unique_ptr<multipoint::protocol::SessionCipher> outbound_cipher_;
@@ -865,6 +940,8 @@ private:
     NSButton* _mediaControlButton;
     NSButton* _startButton;
     NSButton* _autoReconnectButton;
+    NSPopUpButton* _sourcePopup;
+    NSTextField* _healthLabel;
     NSTextField* _receiveNameField;
     NSTextField* _receivePortField;
     NSPopUpButton* _receiveLatencyPopup;
@@ -887,12 +964,65 @@ private:
     BOOL _manualDisconnect;
     BOOL _reconnectScheduled;
     std::shared_ptr<std::atomic<bool>> _startCancellation;
+    std::uint64_t _lastCaptureDrops;
+    std::uint64_t _lastSendFailures;
+}
+
+- (void)refreshAudioSources:(id)sender {
+    (void)sender;
+    NSString* preferred_bundle = nil;
+    if ([_sourcePopup.selectedItem.representedObject isKindOfClass:NSDictionary.class]) {
+        preferred_bundle = _sourcePopup.selectedItem.representedObject[@"bundle"];
+    }
+    if (!preferred_bundle.length) {
+        preferred_bundle = [NSUserDefaults.standardUserDefaults
+            stringForKey:@"selectedAudioSourceBundle"];
+    }
+    [_sourcePopup removeAllItems];
+    [_sourcePopup addItemWithTitle:@"All System Audio"];
+    _sourcePopup.lastItem.image = [NSImage imageWithSystemSymbolName:@"speaker.wave.2"
+                                            accessibilityDescription:@"All audio"];
+    NSInteger preferred_index = 0;
+    for (NSDictionary* application in active_audio_applications()) {
+        [_sourcePopup addItemWithTitle:application[@"name"]];
+        NSMenuItem* item = _sourcePopup.lastItem;
+        item.representedObject = application;
+        NSArray<NSRunningApplication*>* running = [NSRunningApplication
+            runningApplicationsWithBundleIdentifier:application[@"bundle"]];
+        NSString* application_path = running.firstObject.bundleURL.path;
+        if (application_path.length) {
+            item.image = [NSWorkspace.sharedWorkspace iconForFile:application_path];
+        }
+        if ([application[@"bundle"] isEqualToString:preferred_bundle]) {
+            preferred_index = _sourcePopup.numberOfItems - 1;
+        }
+    }
+    [_sourcePopup selectItemAtIndex:preferred_index];
+}
+
+- (void)audioSourceChanged:(id)sender {
+    (void)sender;
+    NSDictionary* source = [_sourcePopup.selectedItem.representedObject
+        isKindOfClass:NSDictionary.class]
+        ? _sourcePopup.selectedItem.representedObject : nil;
+    if (source[@"bundle"]) {
+        [NSUserDefaults.standardUserDefaults setObject:source[@"bundle"]
+                                                forKey:@"selectedAudioSourceBundle"];
+    } else {
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:
+            @"selectedAudioSourceBundle"];
+    }
+    if (_sender && !_starting) {
+        [self toggleSending:nil];
+        _statusLabel.stringValue = @"Switching audio source…";
+        dispatch_async(dispatch_get_main_queue(), ^{ [self toggleSending:nil]; });
+    }
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification*)notification {
     (void)notification;
     _window = [[NSWindow alloc]
-        initWithContentRect:NSMakeRect(0, 0, 520, 650)
+        initWithContentRect:NSMakeRect(0, 0, 520, 730)
                   styleMask:NSWindowStyleMaskTitled |
                             NSWindowStyleMaskClosable |
                             NSWindowStyleMaskMiniaturizable
@@ -1010,7 +1140,8 @@ private:
         [selected_device_box.heightAnchor constraintEqualToConstant:64],
     ]];
 
-    _autoReconnectButton = [NSButton checkboxWithTitle:@"Reconnect to this device automatically"
+    _autoReconnectButton = [NSButton checkboxWithTitle:
+        @"Automatically route audio here when available"
                                                  target:self
                                                  action:@selector(autoReconnectChanged:)];
     _autoReconnectButton.font = [NSFont systemFontOfSize:12];
@@ -1053,6 +1184,34 @@ private:
     receiver_stack.alignment = NSLayoutAttributeLeading;
     receiver_stack.spacing = 10;
 
+    NSTextField* source_label = [NSTextField labelWithString:@"Audio source"];
+    source_label.font = [NSFont systemFontOfSize:11];
+    source_label.textColor = NSColor.secondaryLabelColor;
+    _sourcePopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    _sourcePopup.controlSize = NSControlSizeRegular;
+    _sourcePopup.font = [NSFont systemFontOfSize:13];
+    _sourcePopup.target = self;
+    _sourcePopup.action = @selector(audioSourceChanged:);
+    NSButton* refresh_sources = [NSButton buttonWithImage:
+        [NSImage imageWithSystemSymbolName:@"arrow.clockwise"
+                  accessibilityDescription:@"Refresh audio applications"]
+                                                     target:self
+                                                     action:@selector(refreshAudioSources:)];
+    refresh_sources.bezelStyle = NSBezelStyleInline;
+    NSStackView* source_row = [NSStackView stackViewWithViews:@[
+        _sourcePopup, refresh_sources,
+    ]];
+    source_row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    source_row.alignment = NSLayoutAttributeCenterY;
+    source_row.spacing = 8;
+    NSStackView* source_stack = [NSStackView stackViewWithViews:@[
+        source_label, source_row,
+    ]];
+    source_stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    source_stack.alignment = NSLayoutAttributeLeading;
+    source_stack.spacing = 4;
+    [self refreshAudioSources:nil];
+
     _startButton = [NSButton buttonWithTitle:@"Connect"
                                       target:self
                                       action:@selector(toggleSending:)];
@@ -1064,6 +1223,9 @@ private:
 
     _statusLabel = [NSTextField labelWithString:@"Ready to connect"];
     _statusLabel.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
+    _healthLabel = [NSTextField labelWithString:@"Health  —"];
+    _healthLabel.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
+    _healthLabel.textColor = NSColor.secondaryLabelColor;
     _metricsLabel = [NSTextField labelWithString:@"No active stream"];
     _metricsLabel.textColor = NSColor.secondaryLabelColor;
     _metricsLabel.font = [NSFont monospacedDigitSystemFontOfSize:11
@@ -1101,7 +1263,8 @@ private:
                                   forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     _sendView = [NSStackView stackViewWithViews:@[
-        receiver_stack, _startButton, divider, status_stack, permission_row,
+        receiver_stack, source_stack, _startButton, divider, _healthLabel,
+        status_stack, permission_row,
     ]];
     _sendView.orientation = NSUserInterfaceLayoutOrientationVertical;
     _sendView.alignment = NSLayoutAttributeLeading;
@@ -1294,6 +1457,9 @@ private:
         [_sendView.widthAnchor constraintEqualToAnchor:content.widthAnchor],
         [_receiveView.widthAnchor constraintEqualToAnchor:content.widthAnchor],
         [receiver_stack.widthAnchor constraintEqualToAnchor:content.widthAnchor],
+        [source_stack.widthAnchor constraintEqualToAnchor:content.widthAnchor],
+        [source_row.widthAnchor constraintEqualToAnchor:source_stack.widthAnchor],
+        [_sourcePopup.widthAnchor constraintGreaterThanOrEqualToConstant:390],
         [_receiverPopup.widthAnchor constraintEqualToAnchor:content.widthAnchor],
         [_discoveryLabel.widthAnchor constraintEqualToAnchor:content.widthAnchor],
         [selected_device_box.widthAnchor constraintEqualToAnchor:content.widthAnchor],
@@ -1684,6 +1850,14 @@ private:
     (void)sender;
     _preferManual = _receiverPopup.selectedItem.tag == 9'001;
     [self updateReceiverSelectionUI];
+    const BOOL has_resolved_target =
+        [_receiverPopup.selectedItem.representedObject isKindOfClass:NSNetService.class] ||
+        [_receiverPopup.selectedItem.representedObject isKindOfClass:NSDictionary.class];
+    if (_sender && !_starting && has_resolved_target) {
+        [self toggleSending:nil];
+        _statusLabel.stringValue = @"Handing off audio…";
+        dispatch_async(dispatch_get_main_queue(), ^{ [self toggleSending:nil]; });
+    }
 }
 
 - (NSString*)selectedReceiverIdentifier {
@@ -1836,9 +2010,12 @@ private:
         _hostField.enabled = YES;
         _portField.enabled = YES;
         _receiverPopup.enabled = YES;
+        _sourcePopup.enabled = YES;
         _startButton.title = @"Connect";
         _startButton.bezelColor = NSColor.systemBlueColor;
         _statusLabel.stringValue = @"Disconnected";
+        _healthLabel.stringValue = @"Health  —";
+        _healthLabel.textColor = NSColor.secondaryLabelColor;
         _metricsLabel.stringValue = @"No active stream";
         [self updateReceiverSelectionUI];
         return;
@@ -1902,6 +2079,7 @@ private:
     _hostField.enabled = NO;
     _portField.enabled = NO;
     _receiverPopup.enabled = NO;
+    _sourcePopup.enabled = NO;
     _forgetReceiverButton.enabled = NO;
     _startButton.title = @"Cancel";
     _startButton.bezelColor = NSColor.systemOrangeColor;
@@ -1918,6 +2096,14 @@ private:
     }
     const std::string expected_receiver_id = expected_identifier.length
         ? std::string(expected_identifier.UTF8String) : std::string();
+    std::vector<AudioObjectID> included_processes;
+    NSDictionary* selected_source = [_sourcePopup.selectedItem.representedObject
+        isKindOfClass:NSDictionary.class]
+        ? _sourcePopup.selectedItem.representedObject : nil;
+    if (selected_source[@"object"]) {
+        included_processes.push_back(
+            static_cast<AudioObjectID>([selected_source[@"object"] unsignedIntValue]));
+    }
     _activeReceiverName = receiver_name.length ? [receiver_name copy] : @"receiver";
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         CoreAudioTapSender* new_sender = nullptr;
@@ -1929,6 +2115,7 @@ private:
                 persistent_sender_value(@"soundMuxDeviceID", NO).UTF8String,
                 local_sender_name().UTF8String,
                 expected_receiver_id,
+                included_processes,
                 [self](const std::string& status) {
                     NSString* text = [NSString stringWithUTF8String:status.c_str()];
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1997,6 +2184,7 @@ private:
                 self->_hostField.enabled = YES;
                 self->_portField.enabled = YES;
                 self->_receiverPopup.enabled = YES;
+                self->_sourcePopup.enabled = YES;
                 self->_startButton.title = @"Connect";
                 self->_startButton.bezelColor = NSColor.systemBlueColor;
                 self->_statusLabel.stringValue = [NSString
@@ -2006,10 +2194,16 @@ private:
                 return;
             }
             self->_sender.reset(new_sender);
+            self->_receiverPopup.enabled = YES;
+            self->_sourcePopup.enabled = YES;
             self->_startButton.title = @"Disconnect";
             self->_startButton.bezelColor = NSColor.systemRedColor;
             self->_statusLabel.stringValue = [NSString stringWithFormat:
                 @"Connected to %@", self->_activeReceiverName];
+            self->_healthLabel.stringValue = @"Health  Connecting";
+            self->_healthLabel.textColor = NSColor.systemOrangeColor;
+            self->_lastCaptureDrops = 0;
+            self->_lastSendFailures = 0;
             [self updateReceiverSelectionUI];
         });
     });
@@ -2059,11 +2253,29 @@ private:
         _hostField.enabled = YES;
         _portField.enabled = YES;
         _receiverPopup.enabled = YES;
+        _sourcePopup.enabled = YES;
         _startButton.title = @"Connect";
         _startButton.bezelColor = NSColor.systemBlueColor;
+        _healthLabel.stringValue = @"Health  Offline";
+        _healthLabel.textColor = NSColor.systemRedColor;
         [self scheduleAutoReconnectIfPossible];
         return;
     }
+    const auto failures = stats.send_failures + stats.control_failures;
+    const bool new_failure = failures > _lastSendFailures;
+    const bool new_capture_drop = stats.capture_drops > _lastCaptureDrops;
+    if (new_failure || new_capture_drop || stats.heartbeat_age_ms >= 2'500) {
+        _healthLabel.stringValue = @"Health  Recovering";
+        _healthLabel.textColor = NSColor.systemRedColor;
+    } else if (stats.heartbeat_age_ms >= 1'250) {
+        _healthLabel.stringValue = @"Health  Unstable";
+        _healthLabel.textColor = NSColor.systemOrangeColor;
+    } else {
+        _healthLabel.stringValue = @"Health  Excellent";
+        _healthLabel.textColor = NSColor.systemGreenColor;
+    }
+    _lastCaptureDrops = stats.capture_drops;
+    _lastSendFailures = failures;
     _metricsLabel.stringValue = [NSString stringWithFormat:
         @"Audio packets  %llu    •    FEC packets  %llu\nRemote commands  %llu%@    •    Drops / failures  %llu / %llu    •    Last response %llu ms ago",
         stats.audio_packets,
@@ -2108,6 +2320,7 @@ int main(int argc, char** argv) {
                 persistent_sender_value(@"soundMuxDeviceID", NO).UTF8String,
                 local_sender_name().UTF8String,
                 "",
+                {},
                 [](const std::string& status) { std::cout << status << '\n'; },
                 [](const std::string& code, const std::string& receiver) {
                     std::cout << "Verify " << receiver << " shows code " << code
