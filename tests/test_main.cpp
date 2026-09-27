@@ -1,7 +1,10 @@
 #include "multipoint/audio/spsc_audio_ring.h"
 #include "multipoint/jitter/jitter_buffer.h"
+#include "multipoint/network/connection_plan.h"
 #include "multipoint/protocol/audio_packet.h"
 #include "multipoint/protocol/fec.h"
+#include "multipoint/protocol/session.h"
+#include "multipoint/protocol/session_crypto.h"
 #include "multipoint/transport/receiver_engine.h"
 #include "multipoint/transport/sender_engine.h"
 #include "multipoint/util/sequence.h"
@@ -89,6 +92,122 @@ void test_packet_round_trip() {
                          original.interleaved_samples[index]) <= 1.0F / 32'767.0F,
                 "PCM16 payload exceeded quantization tolerance");
     }
+}
+
+void test_session_protocol_round_trip_and_rejection() {
+    using namespace multipoint::protocol;
+    const SessionMessage hello{
+        .type = SessionMessageType::hello,
+        .fields = {
+            {"device_id", "B78F19A7-7E5F-42BC-90D1-08F0F48D37A2"},
+            {"name", "Studio Mac | Left"},
+            {"platform", "macos"},
+            {"reply_port", "48102"},
+            {"token", "secret%value"},
+        },
+    };
+    const auto bytes = serialize_session(hello);
+    const auto decoded = deserialize_session(bytes);
+    require(decoded.recognized && decoded.valid, decoded.error);
+    require(decoded.message.type == SessionMessageType::hello,
+            "session message type did not round trip");
+    require(decoded.message.fields.at("name") == "Studio Mac | Left",
+            "session field escaping did not round trip");
+    require(decoded.message.fields.at("token") == "secret%value",
+            "session percent escaping did not round trip");
+
+    const std::string duplicate = "SOUNDMUX/2|HELLO|name=a|name=b";
+    const auto duplicate_result = deserialize_session(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(duplicate.data()), duplicate.size()));
+    require(duplicate_result.recognized && !duplicate_result.valid,
+            "duplicate session fields were accepted");
+
+    const auto audio = serialize(make_packet(5));
+    require(!deserialize_session(audio).recognized,
+            "audio datagram was misidentified as session control");
+}
+
+void test_encrypted_session_round_trip_and_tamper_rejection() {
+    using namespace multipoint::protocol;
+    const auto sender = generate_device_key_pair();
+    const auto receiver = generate_device_key_pair();
+    CryptoNonce client_nonce{};
+    CryptoNonce server_nonce{};
+    require(secure_random(client_nonce) && secure_random(server_nonce),
+            "secure nonce generation failed");
+
+    const auto sender_secrets = derive_session_secrets(
+        sender.secret, receiver.public_key, sender.public_key,
+        receiver.public_key, client_nonce, server_nonce);
+    const auto receiver_secrets = derive_session_secrets(
+        receiver.secret, sender.public_key, sender.public_key,
+        receiver.public_key, client_nonce, server_nonce);
+    require(sender_secrets.sender_to_receiver_key ==
+                receiver_secrets.sender_to_receiver_key,
+            "key agreement produced different sender keys");
+    require(sender_secrets.receiver_to_sender_key ==
+                receiver_secrets.receiver_to_sender_key,
+            "key agreement produced different receiver keys");
+    require(proof_matches(
+                sender_secrets.welcome_proof, receiver_secrets.welcome_proof),
+            "welcome proof did not match");
+    require(pairing_code(sender.public_key, receiver.public_key).size() == 6,
+            "pairing code is not six digits");
+
+    SessionCipher encryptor(
+        sender_secrets.sender_to_receiver_key,
+        sender_secrets.sender_nonce_prefix);
+    SessionCipher decryptor(
+        receiver_secrets.sender_to_receiver_key,
+        receiver_secrets.sender_nonce_prefix);
+    const std::string message = "secret audio datagram";
+    const auto plaintext = std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(message.data()), message.size());
+    auto encrypted = encryptor.encrypt(plaintext);
+    const auto decrypted = decryptor.decrypt(encrypted);
+    require(decrypted.recognized && decrypted.valid,
+            "encrypted datagram did not authenticate");
+    require(std::string(
+                reinterpret_cast<const char*>(decrypted.plaintext.data()),
+                decrypted.plaintext.size()) == message,
+            "encrypted datagram plaintext changed");
+    require(!decryptor.decrypt(encrypted).valid,
+            "encrypted datagram replay was accepted");
+
+    auto tampered = encryptor.encrypt(plaintext);
+    tampered[20] ^= std::byte{1};
+    require(!decryptor.decrypt(tampered).valid,
+            "tampered encrypted datagram was accepted");
+
+    const auto encoded = hex_encode(sender.public_key);
+    CryptoKey decoded{};
+    require(hex_decode(encoded, decoded) && decoded == sender.public_key,
+            "crypto key hex encoding did not round trip");
+}
+
+void test_connection_plan_prefers_direct_paths_and_deduplicates() {
+    using namespace multipoint::network;
+    DeviceConnectionState device{
+        .device_id = "receiver-1",
+        .display_name = "Studio phone",
+        .platform = "ios",
+        .pinned_public_key = "abc",
+        .local = {{ConnectionRoute::local_discovery, "phone.local", 48101}},
+        .remembered = {{ConnectionRoute::remembered_address, "10.0.0.4", 48101}},
+        .rendezvous = {
+            {ConnectionRoute::rendezvous_direct, "10.0.0.4", 48101},
+            {ConnectionRoute::rendezvous_direct, "203.0.113.8", 48101},
+        },
+        .relays = {{ConnectionRoute::relay, "relay.soundmux.example", 443}},
+    };
+    const auto plan = make_connection_plan(device);
+    require(plan.size() == 4, "connection plan did not deduplicate routes");
+    require(plan[0].route == ConnectionRoute::local_discovery,
+            "connection plan did not prefer local discovery");
+    require(plan[1].route == ConnectionRoute::remembered_address,
+            "connection plan did not try remembered direct address second");
+    require(plan.back().route == ConnectionRoute::relay,
+            "connection plan did not leave relay as final fallback");
 }
 
 void test_sender_engine_packetization_and_epoch_reset() {
@@ -333,6 +452,9 @@ void test_jitter_latency_recovery() {
 int main() {
     try {
         test_packet_round_trip();
+        test_session_protocol_round_trip_and_rejection();
+        test_encrypted_session_round_trip_and_tamper_rejection();
+        test_connection_plan_prefers_direct_paths_and_deduplicates();
         test_sender_engine_packetization_and_epoch_reset();
         test_receiver_engine_fec_and_epoch_rejection();
         test_receiver_engine_sequence_gap_resync();

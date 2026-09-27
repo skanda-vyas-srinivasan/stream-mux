@@ -9,7 +9,7 @@
     <key>NSAudioCaptureUsageDescription</key>
     <string>SoundMux captures Mac system audio so it can play on your selected receiver.</string>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>SoundMux discovers nearby iPhones and sends system audio to the selected receiver.</string>
+    <string>SoundMux discovers nearby receivers and sends system audio to the selected device.</string>
     <key>NSBonjourServices</key>
     <array>
         <string>_soundmux._udp</string>

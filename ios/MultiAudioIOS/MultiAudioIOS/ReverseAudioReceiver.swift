@@ -1,6 +1,294 @@
 import AVFAudio
 import Foundation
 import Network
+import Security
+import UIKit
+
+private let soundMuxCryptoKeyBytes = 32
+private let soundMuxCryptoNonceBytes = 16
+private let soundMuxCryptoProofBytes = 32
+
+private struct SoundMuxDeviceKey {
+    let secret: Data
+    let publicKey: Data
+
+    static func loadOrCreate(deviceID: String) throws -> SoundMuxDeviceKey {
+        let service = "com.skandavyas.soundmux.device-key"
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: deviceID,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecSuccess, let secret = result as? Data,
+           secret.count == soundMuxCryptoKeyBytes,
+           let publicKey = publicKey(for: secret) {
+            return .init(secret: secret, publicKey: publicKey)
+        }
+        guard status == errSecItemNotFound else {
+            throw ReceiverError.cryptoUnavailable
+        }
+
+        var secret = Data(count: soundMuxCryptoKeyBytes)
+        var publicKey = Data(count: soundMuxCryptoKeyBytes)
+        let generated = secret.withUnsafeMutableBytes { secretBytes in
+            publicKey.withUnsafeMutableBytes { publicBytes in
+                MPCryptoGenerateDeviceKey(
+                    secretBytes.bindMemory(to: UInt8.self).baseAddress,
+                    publicBytes.bindMemory(to: UInt8.self).baseAddress
+                )
+            }
+        }
+        guard generated else { throw ReceiverError.cryptoUnavailable }
+        let add: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: deviceID,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecValueData as String: secret,
+        ]
+        guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else {
+            throw ReceiverError.cryptoUnavailable
+        }
+        return .init(secret: secret, publicKey: publicKey)
+    }
+
+    private static func publicKey(for secret: Data) -> Data? {
+        var output = Data(count: soundMuxCryptoKeyBytes)
+        let success = secret.withUnsafeBytes { secretBytes in
+            output.withUnsafeMutableBytes { outputBytes in
+                MPCryptoPublicKey(
+                    secretBytes.bindMemory(to: UInt8.self).baseAddress,
+                    outputBytes.bindMemory(to: UInt8.self).baseAddress
+                )
+            }
+        }
+        return success ? output : nil
+    }
+}
+
+private struct SoundMuxSessionSecrets {
+    let senderKey: Data
+    let receiverKey: Data
+    let senderNonce: Data
+    let receiverNonce: Data
+    let proof: Data
+
+    static func derive(
+        localSecret: Data,
+        remotePublic: Data,
+        senderPublic: Data,
+        receiverPublic: Data,
+        clientNonce: Data,
+        serverNonce: Data
+    ) -> SoundMuxSessionSecrets? {
+        var senderKey = Data(count: soundMuxCryptoKeyBytes)
+        var receiverKey = Data(count: soundMuxCryptoKeyBytes)
+        var senderNonce = Data(count: soundMuxCryptoNonceBytes)
+        var receiverNonce = Data(count: soundMuxCryptoNonceBytes)
+        var proof = Data(count: soundMuxCryptoProofBytes)
+        let inputs = [localSecret, remotePublic, senderPublic, receiverPublic,
+                      clientNonce, serverNonce]
+        guard inputs.allSatisfy({ !$0.isEmpty }) else { return nil }
+        let success = localSecret.withUnsafeBytes { local in
+            remotePublic.withUnsafeBytes { remote in
+                senderPublic.withUnsafeBytes { sender in
+                    receiverPublic.withUnsafeBytes { receiver in
+                        clientNonce.withUnsafeBytes { client in
+                            serverNonce.withUnsafeBytes { server in
+                                senderKey.withUnsafeMutableBytes { senderKeyBytes in
+                                    receiverKey.withUnsafeMutableBytes { receiverKeyBytes in
+                                        senderNonce.withUnsafeMutableBytes { senderNonceBytes in
+                                            receiverNonce.withUnsafeMutableBytes { receiverNonceBytes in
+                                                proof.withUnsafeMutableBytes { proofBytes in
+                                                    MPCryptoDeriveSession(
+                                                        local.bindMemory(to: UInt8.self).baseAddress,
+                                                        remote.bindMemory(to: UInt8.self).baseAddress,
+                                                        sender.bindMemory(to: UInt8.self).baseAddress,
+                                                        receiver.bindMemory(to: UInt8.self).baseAddress,
+                                                        client.bindMemory(to: UInt8.self).baseAddress,
+                                                        server.bindMemory(to: UInt8.self).baseAddress,
+                                                        senderKeyBytes.bindMemory(to: UInt8.self).baseAddress,
+                                                        receiverKeyBytes.bindMemory(to: UInt8.self).baseAddress,
+                                                        senderNonceBytes.bindMemory(to: UInt8.self).baseAddress,
+                                                        receiverNonceBytes.bindMemory(to: UInt8.self).baseAddress,
+                                                        proofBytes.bindMemory(to: UInt8.self).baseAddress
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        guard success else { return nil }
+        return .init(
+            senderKey: senderKey,
+            receiverKey: receiverKey,
+            senderNonce: senderNonce,
+            receiverNonce: receiverNonce,
+            proof: proof
+        )
+    }
+}
+
+private final class SoundMuxCipher: @unchecked Sendable {
+    enum OpenResult { case notEncrypted, invalid, plaintext(Data) }
+    private var reference: MPSessionCipherRef?
+
+    init?(key: Data, nonce: Data) {
+        reference = key.withUnsafeBytes { keyBytes in
+            nonce.withUnsafeBytes { nonceBytes in
+                MPSessionCipherCreate(
+                    keyBytes.bindMemory(to: UInt8.self).baseAddress,
+                    nonceBytes.bindMemory(to: UInt8.self).baseAddress
+                )
+            }
+        }
+        if reference == nil { return nil }
+    }
+
+    deinit { MPSessionCipherDestroy(reference) }
+
+    func seal(_ plaintext: Data) -> Data? {
+        guard let reference else { return nil }
+        let outputCapacity = plaintext.count + Int(MPCryptoEnvelopeOverhead)
+        var output = Data(count: outputCapacity)
+        var outputSize = 0
+        let success = plaintext.withUnsafeBytes { plaintextBytes in
+            output.withUnsafeMutableBytes { outputBytes in
+                MPSessionCipherEncrypt(
+                    reference,
+                    plaintextBytes.bindMemory(to: UInt8.self).baseAddress,
+                    plaintext.count,
+                    outputBytes.bindMemory(to: UInt8.self).baseAddress,
+                    outputCapacity,
+                    &outputSize
+                )
+            }
+        }
+        guard success else { return nil }
+        output.count = outputSize
+        return output
+    }
+
+    func open(_ datagram: Data) -> OpenResult {
+        guard let reference else { return .invalid }
+        let outputCapacity = datagram.count
+        var output = Data(count: outputCapacity)
+        var outputSize = 0
+        let result = datagram.withUnsafeBytes { datagramBytes in
+            output.withUnsafeMutableBytes { outputBytes in
+                MPSessionCipherDecrypt(
+                    reference,
+                    datagramBytes.bindMemory(to: UInt8.self).baseAddress,
+                    datagram.count,
+                    outputBytes.bindMemory(to: UInt8.self).baseAddress,
+                    outputCapacity,
+                    &outputSize
+                )
+            }
+        }
+        if result == 0 { return .notEncrypted }
+        guard result == 1 else { return .invalid }
+        output.count = outputSize
+        return .plaintext(output)
+    }
+}
+
+private extension Data {
+    var soundMuxHex: String { map { String(format: "%02x", $0) }.joined() }
+
+    static func soundMuxHex(_ text: String, count: Int) -> Data? {
+        var output = Data(count: count)
+        let success = output.withUnsafeMutableBytes { bytes in
+            text.withCString {
+                MPCryptoHexDecode(
+                    $0,
+                    bytes.bindMemory(to: UInt8.self).baseAddress,
+                    count
+                )
+            }
+        }
+        return success ? output : nil
+    }
+
+    static func soundMuxRandom(count: Int) -> Data? {
+        var output = Data(count: count)
+        let success = output.withUnsafeMutableBytes { bytes in
+            MPCryptoRandom(bytes.bindMemory(to: UInt8.self).baseAddress, count)
+        }
+        return success ? output : nil
+    }
+}
+
+struct PendingSoundMuxPairing: Identifiable, Sendable, Equatable {
+    let senderID: String
+    let senderName: String
+    let platform: String
+    let code: String
+
+    var id: String { senderID }
+}
+
+struct TrustedSoundMuxDevice: Identifiable, Sendable, Equatable {
+    let id: String
+    let name: String
+}
+
+private enum SoundMuxSessionKind: String {
+    case hello = "HELLO"
+    case pairRequired = "PAIR_REQUIRED"
+    case rejected = "REJECTED"
+    case welcome = "WELCOME"
+    case ping = "PING"
+    case pong = "PONG"
+}
+
+private struct SoundMuxSessionMessage {
+    let kind: SoundMuxSessionKind
+    let fields: [String: String]
+
+    var data: Data {
+        var components = ["SOUNDMUX/2", kind.rawValue]
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        for key in fields.keys.sorted() {
+            let value = fields[key] ?? ""
+            let escaped = value.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+            components.append("\(key)=\(escaped)")
+        }
+        return Data(components.joined(separator: "|").utf8)
+    }
+
+    static func decode(_ data: Data) -> SoundMuxSessionMessage? {
+        guard data.count <= 1_200, let text = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        let components = text.split(separator: "|", omittingEmptySubsequences: false)
+        guard components.count >= 2,
+              components[0] == "SOUNDMUX/2",
+              let kind = SoundMuxSessionKind(rawValue: String(components[1])) else {
+            return nil
+        }
+        var fields: [String: String] = [:]
+        for component in components.dropFirst(2) {
+            guard let equals = component.firstIndex(of: "=") else { return nil }
+            let key = String(component[..<equals])
+            guard !key.isEmpty, fields[key] == nil else { return nil }
+            let encoded = String(component[component.index(after: equals)...])
+            guard let value = encoded.removingPercentEncoding else { return nil }
+            fields[key] = value
+        }
+        return .init(kind: kind, fields: fields)
+    }
+}
 
 enum RemoteMediaCommand: String, Sendable {
     case previous = "PREVIOUS"
@@ -21,6 +309,10 @@ struct ReverseReceiverSnapshot: Sendable {
     let audioUnderruns: UInt64
     let bufferedFrames: Int
     let playoutActive: Bool
+    let activeSenderName: String?
+    let trustedSenderCount: Int
+    let trustedSenderNames: [String]
+    let trustedDevices: [TrustedSoundMuxDevice]
 }
 
 @MainActor
@@ -39,11 +331,57 @@ final class ReverseAudioReceiver: ObservableObject {
     @Published private(set) var audioUnderruns: UInt64 = 0
     @Published private(set) var bufferedAudio = "0 ms"
     @Published private(set) var errorMessage: String?
+    @Published private(set) var pendingPairing: PendingSoundMuxPairing?
+    @Published private(set) var activeSenderName: String?
+    @Published private(set) var trustedSenderCount = 0
+    @Published private(set) var trustedSenderNames: [String] = []
+    @Published private(set) var trustedDevices: [TrustedSoundMuxDevice] = []
+    @Published var deviceName: String {
+        didSet { UserDefaults.standard.set(deviceName, forKey: "soundMuxDeviceName") }
+    }
+    @Published var outputVolume: Float {
+        didSet {
+            let clamped = min(max(outputVolume, 0), 1)
+            if clamped != outputVolume {
+                outputVolume = clamped
+                return
+            }
+            UserDefaults.standard.set(outputVolume, forKey: "receiverOutputVolume")
+            pipeline.setVolume(outputVolume)
+        }
+    }
+    @Published var targetLatencyMs: Double {
+        didSet {
+            let clamped = min(max(targetLatencyMs, 40), 160)
+            if clamped != targetLatencyMs {
+                targetLatencyMs = clamped
+                return
+            }
+            UserDefaults.standard.set(targetLatencyMs, forKey: "receiverTargetLatencyMs")
+        }
+    }
 
     private let pipeline = ReverseReceiverPipeline()
+    private let deviceID: String
 
     init() {
-        listenPort = UserDefaults.standard.string(forKey: "reverseListenPort") ?? "48101"
+        let defaults = UserDefaults.standard
+        listenPort = defaults.string(forKey: "reverseListenPort") ?? "48101"
+        outputVolume = defaults.object(forKey: "receiverOutputVolume") == nil
+            ? 1
+            : defaults.float(forKey: "receiverOutputVolume")
+        targetLatencyMs = defaults.object(forKey: "receiverTargetLatencyMs") == nil
+            ? 60
+            : defaults.double(forKey: "receiverTargetLatencyMs")
+        deviceName = defaults.string(forKey: "soundMuxDeviceName")
+            ?? UIDevice.current.name
+        if let existing = defaults.string(forKey: "soundMuxDeviceID") {
+            deviceID = existing
+        } else {
+            let created = UUID().uuidString
+            defaults.set(created, forKey: "soundMuxDeviceID")
+            deviceID = created
+        }
     }
 
     func start() {
@@ -52,13 +390,29 @@ final class ReverseAudioReceiver: ObservableObject {
             errorMessage = "Enter a valid UDP port."
             return
         }
+        let advertisedName = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !advertisedName.isEmpty else {
+            errorMessage = "Enter a receiver name."
+            return
+        }
         errorMessage = nil
         do {
-            try pipeline.start(port: port) { [weak self] snapshot in
-                Task { @MainActor [weak self] in
-                    self?.apply(snapshot)
+            let prebufferFrames = Int(48_000 * targetLatencyMs / 1_000)
+            let reorderPackets = max(3, min(24, prebufferFrames / 240))
+            try pipeline.start(
+                port: port,
+                reorderPackets: reorderPackets,
+                prebufferFrames: prebufferFrames,
+                receiverID: deviceID,
+                receiverName: advertisedName,
+                volume: outputVolume,
+                snapshotHandler: { [weak self] snapshot in
+                    Task { @MainActor [weak self] in self?.apply(snapshot) }
+                },
+                pairingHandler: { [weak self] pairing in
+                    Task { @MainActor [weak self] in self?.pendingPairing = pairing }
                 }
-            }
+            )
             isListening = true
             state = "Starting"
         } catch {
@@ -77,10 +431,30 @@ final class ReverseAudioReceiver: ObservableObject {
         pipeline.stop()
         isListening = false
         state = "Stopped"
+        pendingPairing = nil
+        activeSenderName = nil
     }
 
     func send(_ command: RemoteMediaCommand) {
         pipeline.send(command)
+    }
+
+    func approvePairing() {
+        guard let pendingPairing else { return }
+        pipeline.approvePairing(senderID: pendingPairing.senderID)
+    }
+
+    func rejectPairing() {
+        guard let pendingPairing else { return }
+        pipeline.rejectPairing(senderID: pendingPairing.senderID)
+    }
+
+    func forgetTrustedSenders() {
+        pipeline.forgetTrustedSenders()
+    }
+
+    func forgetTrustedSender(id: String) {
+        pipeline.forgetTrustedSender(id: id)
     }
 
     private func apply(_ snapshot: ReverseReceiverSnapshot) {
@@ -96,6 +470,10 @@ final class ReverseAudioReceiver: ObservableObject {
             format: "%.0f ms",
             Double(snapshot.bufferedFrames) * 1_000 / 48_000
         )
+        activeSenderName = snapshot.activeSenderName
+        trustedSenderCount = snapshot.trustedSenderCount
+        trustedSenderNames = snapshot.trustedSenderNames
+        trustedDevices = snapshot.trustedDevices
     }
 }
 
@@ -115,8 +493,8 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
     private let receiverLock = NSLock()
     private var receiver: MPReceiverEngineRef?
     private var listener: NWListener?
-    private var connections: [NWConnection] = []
-    private var controlConnection: NWConnection?
+    private var peers: [ObjectIdentifier: ReceiverPeer] = [:]
+    private var activePeer: ReceiverPeer?
     private var pumpTimer: DispatchSourceTimer?
     private var metricsTimer: DispatchSourceTimer?
     private var inactiveObserver: NSObjectProtocol?
@@ -126,17 +504,63 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
     private var sourceNode: AVAudioSourceNode?
     private var renderScratch: UnsafeMutablePointer<Float>?
     private var audioInterrupted = false
+    private var receiverID = ""
+    private var receiverName = "SoundMux receiver"
+    private var outputVolume: Float = 1
+    private var pairingHandler: (@Sendable (PendingSoundMuxPairing?) -> Void)?
+    private var trustedSenders: [String: String] = [:]
+    private var trustedSenderNames: [String: String] = [:]
+    private var deviceKey: SoundMuxDeviceKey?
+
+    private final class ReceiverPeer: @unchecked Sendable {
+        let connection: NWConnection
+        let host: NWEndpoint.Host
+        var senderID = ""
+        var senderName = "Unknown device"
+        var platform = "unknown"
+        var senderPublicKey: Data?
+        var clientNonce: Data?
+        var serverNonce: Data?
+        var authorized = false
+        var pairingCode: String?
+        var controlConnection: NWConnection?
+        var inboundCipher: SoundMuxCipher?
+        var outboundCipher: SoundMuxCipher?
+        var lastSeen = DispatchTime.now().uptimeNanoseconds
+
+        init(connection: NWConnection, host: NWEndpoint.Host) {
+            self.connection = connection
+            self.host = host
+        }
+    }
 
     func start(
         port: UInt16,
-        snapshotHandler: @escaping @Sendable (ReverseReceiverSnapshot) -> Void
+        reorderPackets: Int,
+        prebufferFrames: Int,
+        receiverID: String,
+        receiverName: String,
+        volume: Float,
+        snapshotHandler: @escaping @Sendable (ReverseReceiverSnapshot) -> Void,
+        pairingHandler: @escaping @Sendable (PendingSoundMuxPairing?) -> Void
     ) throws {
         stop()
-        guard let receiver = MPReceiverEngineCreate(12, 2_880) else {
+        guard let receiver = MPReceiverEngineCreate(reorderPackets, prebufferFrames) else {
             throw ReceiverError.initializationFailed
         }
         self.receiver = receiver
+        self.receiverID = receiverID
+        self.receiverName = receiverName
+        self.outputVolume = volume
+        self.deviceKey = try SoundMuxDeviceKey.loadOrCreate(deviceID: receiverID)
+        self.trustedSenders = UserDefaults.standard.dictionary(
+            forKey: "soundMuxTrustedSenders"
+        ) as? [String: String] ?? [:]
+        self.trustedSenderNames = UserDefaults.standard.dictionary(
+            forKey: "soundMuxTrustedSenderNames"
+        ) as? [String: String] ?? [:]
         self.snapshotHandler = snapshotHandler
+        self.pairingHandler = pairingHandler
 
         do {
             try startAudio(receiver: receiver)
@@ -154,18 +578,20 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
         inactiveObserver = nil
         resumptionObserver = nil
         networkQueue.sync {
+            metricsTimer?.cancel()
+            metricsTimer = nil
             listener?.cancel()
             listener = nil
-            for connection in connections { connection.cancel() }
-            connections.removeAll()
-            controlConnection?.cancel()
-            controlConnection = nil
+            for peer in peers.values {
+                peer.connection.cancel()
+                peer.controlConnection?.cancel()
+            }
+            peers.removeAll()
+            activePeer = nil
         }
         playoutQueue.sync {
             pumpTimer?.cancel()
             pumpTimer = nil
-            metricsTimer?.cancel()
-            metricsTimer = nil
             audioInterrupted = false
         }
 
@@ -181,6 +607,71 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
             receiver = nil
         }
         snapshotHandler = nil
+        pairingHandler = nil
+        deviceKey = nil
+    }
+
+    func setVolume(_ volume: Float) {
+        playoutQueue.async { [weak self] in
+            guard let self else { return }
+            self.outputVolume = min(max(volume, 0), 1)
+            self.engine?.mainMixerNode.outputVolume = self.outputVolume
+        }
+    }
+
+    func approvePairing(senderID: String) {
+        networkQueue.async { [weak self] in self?.finishPairing(senderID: senderID) }
+    }
+
+    func rejectPairing(senderID: String) {
+        networkQueue.async { [weak self] in
+            guard let self,
+                  let peer = self.peers.values.first(where: { $0.senderID == senderID }) else {
+                return
+            }
+            self.sendControl(
+                .init(kind: .rejected, fields: ["reason": "Pairing declined"]),
+                to: peer
+            )
+            peer.pairingCode = nil
+            self.pairingHandler?(nil)
+        }
+    }
+
+    func forgetTrustedSenders() {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.trustedSenders.removeAll()
+            self.trustedSenderNames.removeAll()
+            UserDefaults.standard.removeObject(forKey: "soundMuxTrustedSenders")
+            UserDefaults.standard.removeObject(forKey: "soundMuxTrustedSenderNames")
+            for peer in self.peers.values { peer.authorized = false }
+            self.activePeer = nil
+            self.receiverLock.withLock { MPReceiverEngineRebuffer(self.receiver) }
+            self.pairingHandler?(nil)
+            self.publish(state: "Listening")
+        }
+    }
+
+    func forgetTrustedSender(id: String) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.trustedSenders.removeValue(forKey: id)
+            self.trustedSenderNames.removeValue(forKey: id)
+            UserDefaults.standard.set(
+                self.trustedSenders, forKey: "soundMuxTrustedSenders")
+            UserDefaults.standard.set(
+                self.trustedSenderNames, forKey: "soundMuxTrustedSenderNames")
+            for peer in self.peers.values where peer.senderID == id {
+                peer.authorized = false
+                peer.inboundCipher = nil
+                peer.outboundCipher = nil
+                if self.activePeer === peer { self.activePeer = nil }
+            }
+            self.receiverLock.withLock { MPReceiverEngineRebuffer(self.receiver) }
+            self.pairingHandler?(nil)
+            self.publish(state: "Listening")
+        }
     }
 
     private func startAudio(receiver: MPReceiverEngineRef) throws {
@@ -245,6 +736,7 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
         let newEngine = AVAudioEngine()
         newEngine.attach(source)
         try newEngine.connectNode(source, to: newEngine.mainMixerNode, format: format)
+        newEngine.mainMixerNode.outputVolume = outputVolume
         newEngine.prepare()
         try newEngine.start()
         sourceNode = source
@@ -284,7 +776,7 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
         receiverLock.withLock {
             MPReceiverEngineRebuffer(receiver)
         }
-        publish(state: "Audio interrupted")
+        networkQueue.async { [weak self] in self?.publish(state: "Audio interrupted") }
     }
 
     private func resumeAudioAfterInterruption() {
@@ -300,9 +792,10 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
                 try engine.start()
             }
             audioInterrupted = false
-            publish(state: "Buffering")
+            networkQueue.async { [weak self] in self?.publish(state: "Buffering") }
         } catch {
-            publish(state: "Audio resume failed: \(error.localizedDescription)")
+            let message = "Audio resume failed: \(error.localizedDescription)"
+            networkQueue.async { [weak self] in self?.publish(state: message) }
         }
     }
 
@@ -314,9 +807,20 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
         let parameters = NWParameters.udp
         parameters.allowLocalEndpointReuse = true
         let newListener = try NWListener(using: parameters, on: endpointPort)
+        let txtRecord = NWTXTRecord([
+            "id": receiverID,
+            "name": receiverName,
+            "platform": "ios",
+            "protocol": "3",
+            "session": "3",
+            "security": "x25519+xchacha20poly1305",
+            "public_key": deviceKey?.publicKey.soundMuxHex ?? "",
+            "capabilities": "audio,media,airplay,pairing,volume,latency,encryption",
+        ])
         newListener.service = NWListener.Service(
-            name: "SoundMux iPhone",
-            type: "_soundmux._udp"
+            name: "\(receiverName) · SoundMux",
+            type: "_soundmux._udp",
+            txtRecord: txtRecord
         )
         newListener.stateUpdateHandler = { [weak self, weak newListener] state in
             guard let self, let newListener, self.listener === newListener else { return }
@@ -327,10 +831,12 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
                 connection.cancel()
                 return
             }
-            self.connections.append(connection)
-            if case .hostPort(let host, _) = connection.endpoint {
-                self.connectControls(to: host, port: port + 1)
+            guard case .hostPort(let host, _) = connection.endpoint else {
+                connection.cancel()
+                return
             }
+            let peer = ReceiverPeer(connection: connection, host: host)
+            self.peers[ObjectIdentifier(connection)] = peer
             connection.stateUpdateHandler = { [weak self, weak connection] state in
                 guard let self, let connection else { return }
                 if case .failed = state { self.remove(connection) }
@@ -347,25 +853,27 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
 
     func send(_ command: RemoteMediaCommand) {
         networkQueue.async { [weak self] in
-            guard let connection = self?.controlConnection else { return }
+            guard let peer = self?.activePeer,
+                  let connection = peer.controlConnection,
+                  let payload = peer.outboundCipher?.seal(command.payload) else { return }
             connection.send(
-                content: command.payload,
+                content: payload,
                 completion: .contentProcessed { _ in }
             )
         }
     }
 
-    private func connectControls(to host: NWEndpoint.Host, port: UInt16) {
-        controlConnection?.cancel()
+    private func connectControls(for peer: ReceiverPeer, port: UInt16) {
+        peer.controlConnection?.cancel()
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else { return }
-        let connection = NWConnection(host: host, port: endpointPort, using: .udp)
-        controlConnection = connection
-        connection.stateUpdateHandler = { [weak self, weak connection] state in
-            guard let self, let connection, self.controlConnection === connection else {
+        let connection = NWConnection(host: peer.host, port: endpointPort, using: .udp)
+        peer.controlConnection = connection
+        connection.stateUpdateHandler = { [weak connection] state in
+            guard let connection, peer.controlConnection === connection else {
                 return
             }
-            if case .failed = state { self.controlConnection = nil }
-            if case .cancelled = state { self.controlConnection = nil }
+            if case .failed = state { peer.controlConnection = nil }
+            if case .cancelled = state { peer.controlConnection = nil }
         }
         connection.start(queue: networkQueue)
     }
@@ -374,22 +882,20 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
         connection.receiveMessage { [weak self, weak connection] data, _, _, error in
             guard let self, let connection else { return }
             if let data, !data.isEmpty {
-                let arrivalNS = DispatchTime.now().uptimeNanoseconds
-                self.receiverLock.withLock {
-                    guard let receiver = self.receiver else { return }
-                    var hardResync = false
-                    data.withUnsafeBytes { bytes in
-                        guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else {
-                            return
-                        }
-                        _ = MPReceiverEngineIngest(
-                            receiver,
-                            base,
-                            data.count,
-                            arrivalNS,
-                            &hardResync
-                        )
+                guard let peer = self.peers[ObjectIdentifier(connection)] else { return }
+                peer.lastSeen = DispatchTime.now().uptimeNanoseconds
+                if peer.authorized {
+                    guard case .plaintext(let plaintext) = peer.inboundCipher?.open(data) else {
+                        if error == nil { self.receiveNext(on: connection) }
+                        return
                     }
+                    if let message = SoundMuxSessionMessage.decode(plaintext) {
+                        self.handleSession(message, from: peer)
+                    } else {
+                        self.ingestAudio(plaintext)
+                    }
+                } else if let message = SoundMuxSessionMessage.decode(data) {
+                    self.handleSession(message, from: peer)
                 }
             }
             if error == nil {
@@ -400,8 +906,196 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
         }
     }
 
+    private func ingestAudio(_ data: Data) {
+        let arrivalNS = DispatchTime.now().uptimeNanoseconds
+        receiverLock.withLock {
+            guard let receiver else { return }
+            var hardResync = false
+            data.withUnsafeBytes { bytes in
+                guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
+                _ = MPReceiverEngineIngest(
+                    receiver, base, data.count, arrivalNS, &hardResync
+                )
+            }
+        }
+    }
+
     private func remove(_ connection: NWConnection) {
-        connections.removeAll { $0 === connection }
+        guard let peer = peers.removeValue(forKey: ObjectIdentifier(connection)) else {
+            return
+        }
+        peer.controlConnection?.cancel()
+        if activePeer === peer { activePeer = nil }
+    }
+
+    private func handleSession(_ message: SoundMuxSessionMessage, from peer: ReceiverPeer) {
+        switch message.kind {
+        case .hello:
+            guard let senderID = message.fields["device_id"], !senderID.isEmpty,
+                  let senderName = message.fields["name"], !senderName.isEmpty,
+                  message.fields["session"] == "3",
+                  let publicKeyText = message.fields["public_key"],
+                  let senderPublicKey = Data.soundMuxHex(
+                      publicKeyText, count: soundMuxCryptoKeyBytes),
+                  let clientNonceText = message.fields["client_nonce"],
+                  let clientNonce = Data.soundMuxHex(
+                      clientNonceText, count: soundMuxCryptoNonceBytes),
+                  let replyText = message.fields["reply_port"],
+                  let replyPort = UInt16(replyText), replyPort > 0,
+                  let deviceKey else {
+                return
+            }
+            peer.senderID = senderID
+            peer.senderName = senderName
+            peer.platform = message.fields["platform"] ?? "unknown"
+            if peer.clientNonce != clientNonce || peer.senderPublicKey != senderPublicKey {
+                peer.senderPublicKey = senderPublicKey
+                peer.clientNonce = clientNonce
+                peer.serverNonce = Data.soundMuxRandom(count: soundMuxCryptoNonceBytes)
+                peer.pairingCode = nil
+                peer.inboundCipher = nil
+                peer.outboundCipher = nil
+            }
+            guard let serverNonce = peer.serverNonce,
+                  let secrets = SoundMuxSessionSecrets.derive(
+                      localSecret: deviceKey.secret,
+                      remotePublic: senderPublicKey,
+                      senderPublic: senderPublicKey,
+                      receiverPublic: deviceKey.publicKey,
+                      clientNonce: clientNonce,
+                      serverNonce: serverNonce
+                  ),
+                  let inbound = SoundMuxCipher(
+                      key: secrets.senderKey, nonce: secrets.senderNonce),
+                  let outbound = SoundMuxCipher(
+                      key: secrets.receiverKey, nonce: secrets.receiverNonce) else {
+                return
+            }
+            peer.inboundCipher = inbound
+            peer.outboundCipher = outbound
+            connectControls(for: peer, port: replyPort)
+            let pairRequested = message.fields["pair_requested"] == "1"
+            if trustedSenders[senderID] == publicKeyText, !pairRequested {
+                authorize(peer, secrets: secrets)
+                return
+            }
+            if peer.pairingCode == nil {
+                var code = [CChar](repeating: 0, count: 7)
+                let success = senderPublicKey.withUnsafeBytes { senderBytes in
+                    deviceKey.publicKey.withUnsafeBytes { receiverBytes in
+                        MPCryptoPairingCode(
+                            senderBytes.bindMemory(to: UInt8.self).baseAddress,
+                            receiverBytes.bindMemory(to: UInt8.self).baseAddress,
+                            &code,
+                            code.count
+                        )
+                    }
+                }
+                guard success else { return }
+                peer.pairingCode = String(decoding: code.prefix(6).map(UInt8.init), as: UTF8.self)
+            }
+            guard let code = peer.pairingCode else { return }
+            sendControl(
+                .init(kind: .pairRequired, fields: [
+                    "receiver_id": receiverID,
+                    "receiver_name": receiverName,
+                    "platform": "ios",
+                    "public_key": deviceKey.publicKey.soundMuxHex,
+                    "server_nonce": serverNonce.soundMuxHex,
+                    "code": code,
+                ]),
+                to: peer
+            )
+            pairingHandler?(.init(
+                senderID: senderID,
+                senderName: senderName,
+                platform: peer.platform,
+                code: code
+            ))
+        case .ping:
+            guard peer.authorized else { return }
+            sendSecureControl(
+                .init(kind: .pong, fields: [
+                    "receiver_id": receiverID,
+                    "counter": message.fields["counter"] ?? "0",
+                ]),
+                to: peer
+            )
+        case .pairRequired, .rejected, .welcome, .pong:
+            break
+        }
+    }
+
+    private func finishPairing(senderID: String) {
+        guard let peer = peers.values.first(where: {
+            $0.senderID == senderID && $0.pairingCode != nil
+        }) else { return }
+        guard let publicKey = peer.senderPublicKey,
+              let publicKeyText = messageKey(publicKey),
+              let deviceKey,
+              let clientNonce = peer.clientNonce,
+              let serverNonce = peer.serverNonce,
+              let secrets = SoundMuxSessionSecrets.derive(
+                  localSecret: deviceKey.secret,
+                  remotePublic: publicKey,
+                  senderPublic: publicKey,
+                  receiverPublic: deviceKey.publicKey,
+                  clientNonce: clientNonce,
+                  serverNonce: serverNonce
+              ) else { return }
+        trustedSenders[senderID] = publicKeyText
+        trustedSenderNames[senderID] = peer.senderName
+        UserDefaults.standard.set(trustedSenders, forKey: "soundMuxTrustedSenders")
+        UserDefaults.standard.set(
+            trustedSenderNames,
+            forKey: "soundMuxTrustedSenderNames"
+        )
+        peer.pairingCode = nil
+        pairingHandler?(nil)
+        authorize(peer, secrets: secrets)
+    }
+
+    private func authorize(_ peer: ReceiverPeer, secrets: SoundMuxSessionSecrets) {
+        if activePeer !== peer {
+            receiverLock.withLock { MPReceiverEngineRebuffer(receiver) }
+        }
+        peer.authorized = true
+        activePeer = peer
+        sendControl(
+            .init(kind: .welcome, fields: [
+                "receiver_id": receiverID,
+                "receiver_name": receiverName,
+                "platform": "ios",
+                "protocol": "3",
+                "session": "3",
+                "public_key": deviceKey?.publicKey.soundMuxHex ?? "",
+                "server_nonce": peer.serverNonce?.soundMuxHex ?? "",
+                "proof": secrets.proof.soundMuxHex,
+                "heartbeat_ms": "1000",
+                "capabilities": "audio,media,airplay,pairing,volume,latency,encryption",
+            ]),
+            to: peer
+        )
+        publish(state: "Connected")
+    }
+
+    private func sendControl(_ message: SoundMuxSessionMessage, to peer: ReceiverPeer) {
+        peer.controlConnection?.send(
+            content: message.data,
+            completion: .contentProcessed { _ in }
+        )
+    }
+
+    private func sendSecureControl(_ message: SoundMuxSessionMessage, to peer: ReceiverPeer) {
+        guard let encrypted = peer.outboundCipher?.seal(message.data) else { return }
+        peer.controlConnection?.send(
+            content: encrypted,
+            completion: .contentProcessed { _ in }
+        )
+    }
+
+    private func messageKey(_ data: Data) -> String? {
+        data.count == soundMuxCryptoKeyBytes ? data.soundMuxHex : nil
     }
 
     private func startTimers() {
@@ -417,7 +1111,7 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
         pump.resume()
         pumpTimer = pump
 
-        let metrics = DispatchSource.makeTimerSource(queue: playoutQueue)
+        let metrics = DispatchSource.makeTimerSource(queue: networkQueue)
         metrics.schedule(deadline: .now(), repeating: .seconds(1))
         metrics.setEventHandler { [weak self] in self?.publish() }
         metrics.resume()
@@ -433,6 +1127,8 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
             currentState = "Playing"
         } else if stats.valid_datagrams > 0 {
             currentState = "Buffering"
+        } else if activePeer?.authorized == true {
+            currentState = "Connected"
         } else {
             currentState = "Listening"
         }
@@ -446,7 +1142,18 @@ private final class ReverseReceiverPipeline: @unchecked Sendable {
             concealedPackets: stats.concealed_packets,
             audioUnderruns: stats.audio_underruns,
             bufferedFrames: stats.buffered_frames,
-            playoutActive: stats.playout_active
+            playoutActive: stats.playout_active,
+            activeSenderName: activePeer?.authorized == true ? activePeer?.senderName : nil,
+            trustedSenderCount: trustedSenders.count,
+            trustedSenderNames: trustedSenders.keys.map {
+                trustedSenderNames[$0] ?? "Unknown sender"
+            }.sorted(),
+            trustedDevices: trustedSenders.keys.map {
+                TrustedSoundMuxDevice(
+                    id: $0,
+                    name: trustedSenderNames[$0] ?? "Unknown sender"
+                )
+            }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         ))
     }
 
@@ -466,12 +1173,14 @@ private enum ReceiverError: LocalizedError {
     case initializationFailed
     case invalidPort
     case audioFormatUnavailable
+    case cryptoUnavailable
 
     var errorDescription: String? {
         switch self {
         case .initializationFailed: "Could not initialize the receiver engine."
         case .invalidPort: "The UDP listen port is invalid."
         case .audioFormatUnavailable: "The 48 kHz stereo playback format is unavailable."
+        case .cryptoUnavailable: "Could not create or load this device's secure identity."
         }
     }
 }

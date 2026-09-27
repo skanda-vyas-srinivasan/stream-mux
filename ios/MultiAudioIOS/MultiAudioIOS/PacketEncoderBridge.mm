@@ -2,6 +2,7 @@
 
 #include "multipoint/audio/spsc_audio_ring.h"
 #include "multipoint/protocol/audio_packet.h"
+#include "multipoint/protocol/session_crypto.h"
 #include "multipoint/network/udp_socket.h"
 #include "multipoint/transport/receiver_engine.h"
 #include "multipoint/transport/sender_engine.h"
@@ -14,6 +15,26 @@
 #include <mutex>
 #include <new>
 #include <optional>
+
+using multipoint::protocol::CryptoKey;
+using multipoint::protocol::CryptoNonce;
+using multipoint::protocol::CryptoProof;
+
+namespace {
+
+template <typename Array>
+Array crypto_array(const std::uint8_t* input) {
+    Array output{};
+    std::memcpy(output.data(), input, output.size());
+    return output;
+}
+
+template <typename Array>
+void copy_crypto_array(const Array& input, std::uint8_t* output) {
+    std::memcpy(output, input.data(), input.size());
+}
+
+}  // namespace
 
 namespace {
 
@@ -280,4 +301,160 @@ bool MPUdpSenderSend(MPUdpSenderRef sender, const uint8_t* bytes, size_t size) {
 
 void MPUdpSenderDestroy(MPUdpSenderRef sender) {
     delete static_cast<multipoint::network::UdpSender*>(sender);
+}
+
+bool MPCryptoGenerateDeviceKey(uint8_t* secret_key, uint8_t* public_key) {
+    if (!secret_key || !public_key) return false;
+    try {
+        const auto pair = multipoint::protocol::generate_device_key_pair();
+        copy_crypto_array(pair.secret, secret_key);
+        copy_crypto_array(pair.public_key, public_key);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool MPCryptoPublicKey(const uint8_t* secret_key, uint8_t* public_key) {
+    if (!secret_key || !public_key) return false;
+    try {
+        copy_crypto_array(
+            multipoint::protocol::public_key_for(crypto_array<CryptoKey>(secret_key)),
+            public_key);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool MPCryptoRandom(uint8_t* output, size_t size) {
+    return output && multipoint::protocol::secure_random(std::span<std::byte>(
+        reinterpret_cast<std::byte*>(output), size));
+}
+
+bool MPCryptoDeriveSession(
+    const uint8_t* local_secret_key,
+    const uint8_t* remote_public_key,
+    const uint8_t* sender_public_key,
+    const uint8_t* receiver_public_key,
+    const uint8_t* client_nonce,
+    const uint8_t* server_nonce,
+    uint8_t* sender_key,
+    uint8_t* receiver_key,
+    uint8_t* sender_nonce_prefix,
+    uint8_t* receiver_nonce_prefix,
+    uint8_t* welcome_proof) {
+    if (!local_secret_key || !remote_public_key || !sender_public_key ||
+        !receiver_public_key || !client_nonce || !server_nonce || !sender_key ||
+        !receiver_key || !sender_nonce_prefix || !receiver_nonce_prefix ||
+        !welcome_proof) {
+        return false;
+    }
+    try {
+        const auto secrets = multipoint::protocol::derive_session_secrets(
+            crypto_array<CryptoKey>(local_secret_key),
+            crypto_array<CryptoKey>(remote_public_key),
+            crypto_array<CryptoKey>(sender_public_key),
+            crypto_array<CryptoKey>(receiver_public_key),
+            crypto_array<CryptoNonce>(client_nonce),
+            crypto_array<CryptoNonce>(server_nonce));
+        copy_crypto_array(secrets.sender_to_receiver_key, sender_key);
+        copy_crypto_array(secrets.receiver_to_sender_key, receiver_key);
+        copy_crypto_array(secrets.sender_nonce_prefix, sender_nonce_prefix);
+        copy_crypto_array(secrets.receiver_nonce_prefix, receiver_nonce_prefix);
+        copy_crypto_array(secrets.welcome_proof, welcome_proof);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool MPCryptoPairingCode(
+    const uint8_t* sender_public_key,
+    const uint8_t* receiver_public_key,
+    char* output,
+    size_t output_size) {
+    if (!sender_public_key || !receiver_public_key || !output || output_size < 7) {
+        return false;
+    }
+    try {
+        const auto code = multipoint::protocol::pairing_code(
+            crypto_array<CryptoKey>(sender_public_key),
+            crypto_array<CryptoKey>(receiver_public_key));
+        std::memcpy(output, code.c_str(), code.size() + 1);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool MPCryptoHexDecode(const char* text, uint8_t* output, size_t output_size) {
+    if (!text || !output) return false;
+    return multipoint::protocol::hex_decode(
+        text, std::span<std::byte>(reinterpret_cast<std::byte*>(output), output_size));
+}
+
+bool MPCryptoProofMatches(const uint8_t* expected, const uint8_t* actual) {
+    if (!expected || !actual) return false;
+    return multipoint::protocol::proof_matches(
+        crypto_array<CryptoProof>(expected), crypto_array<CryptoProof>(actual));
+}
+
+MPSessionCipherRef MPSessionCipherCreate(
+    const uint8_t* key,
+    const uint8_t* nonce_prefix) {
+    if (!key || !nonce_prefix) return nullptr;
+    try {
+        return new multipoint::protocol::SessionCipher(
+            crypto_array<CryptoKey>(key), crypto_array<CryptoNonce>(nonce_prefix));
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+bool MPSessionCipherEncrypt(
+    MPSessionCipherRef cipher,
+    const uint8_t* plaintext,
+    size_t plaintext_size,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* output_size) {
+    if (!cipher || !plaintext || !output || !output_size) return false;
+    try {
+        const auto encrypted = static_cast<multipoint::protocol::SessionCipher*>(cipher)
+            ->encrypt(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(plaintext), plaintext_size));
+        if (encrypted.size() > output_capacity) return false;
+        std::memcpy(output, encrypted.data(), encrypted.size());
+        *output_size = encrypted.size();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+int MPSessionCipherDecrypt(
+    MPSessionCipherRef cipher,
+    const uint8_t* datagram,
+    size_t datagram_size,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* output_size) {
+    if (!cipher || !datagram || !output || !output_size) return -1;
+    try {
+        const auto result = static_cast<multipoint::protocol::SessionCipher*>(cipher)
+            ->decrypt(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(datagram), datagram_size));
+        if (!result.recognized) return 0;
+        if (!result.valid || result.plaintext.size() > output_capacity) return -1;
+        std::memcpy(output, result.plaintext.data(), result.plaintext.size());
+        *output_size = result.plaintext.size();
+        return 1;
+    } catch (...) {
+        return -1;
+    }
+}
+
+void MPSessionCipherDestroy(MPSessionCipherRef cipher) {
+    delete static_cast<multipoint::protocol::SessionCipher*>(cipher);
 }

@@ -16,6 +16,10 @@ enum {
     MPAudioFECDataShards = 10,
     MPAudioFECParityShards = 5,
     MPAudioDatagramSize = 52 + MPAudioSamplesPerPacket * 2,
+    MPCryptoKeySize = 32,
+    MPCryptoNonceSize = 16,
+    MPCryptoProofSize = 32,
+    MPCryptoEnvelopeOverhead = 32,
 };
 
 typedef void* MPSenderEngineRef;
@@ -80,6 +84,52 @@ typedef void* MPUdpSenderRef;
 MPUdpSenderRef MPUdpSenderCreate(const char* host, uint16_t port);
 bool MPUdpSenderSend(MPUdpSenderRef sender, const uint8_t* bytes, size_t size);
 void MPUdpSenderDestroy(MPUdpSenderRef sender);
+
+typedef void* MPSessionCipherRef;
+
+bool MPCryptoGenerateDeviceKey(uint8_t* secret_key, uint8_t* public_key);
+bool MPCryptoPublicKey(const uint8_t* secret_key, uint8_t* public_key);
+bool MPCryptoRandom(uint8_t* output, size_t size);
+bool MPCryptoDeriveSession(
+    const uint8_t* local_secret_key,
+    const uint8_t* remote_public_key,
+    const uint8_t* sender_public_key,
+    const uint8_t* receiver_public_key,
+    const uint8_t* client_nonce,
+    const uint8_t* server_nonce,
+    uint8_t* sender_key,
+    uint8_t* receiver_key,
+    uint8_t* sender_nonce_prefix,
+    uint8_t* receiver_nonce_prefix,
+    uint8_t* welcome_proof);
+bool MPCryptoPairingCode(
+    const uint8_t* sender_public_key,
+    const uint8_t* receiver_public_key,
+    char* output,
+    size_t output_size);
+bool MPCryptoHexDecode(const char* text, uint8_t* output, size_t output_size);
+bool MPCryptoProofMatches(const uint8_t* expected, const uint8_t* actual);
+
+MPSessionCipherRef MPSessionCipherCreate(
+    const uint8_t* key,
+    const uint8_t* nonce_prefix);
+bool MPSessionCipherEncrypt(
+    MPSessionCipherRef cipher,
+    const uint8_t* plaintext,
+    size_t plaintext_size,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* output_size);
+// Returns 1 for an authenticated envelope, 0 for non-encrypted input, and -1
+// for a malformed, replayed, or unauthenticated encrypted envelope.
+int MPSessionCipherDecrypt(
+    MPSessionCipherRef cipher,
+    const uint8_t* datagram,
+    size_t datagram_size,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* output_size);
+void MPSessionCipherDestroy(MPSessionCipherRef cipher);
 
 #ifdef __cplusplus
 }

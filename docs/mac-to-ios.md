@@ -39,18 +39,20 @@ bundle identifier.
 
 1. Put the Mac and iPhone on the same reachable local network.
 2. Open SoundMux on the iPhone.
-3. The phone starts listening on port `48101` and advertises **SoundMux iPhone**
-   automatically. Accept the local-network prompt if iOS shows one.
+3. The phone starts listening on port `48101` and advertises its saved receiver
+   name automatically. Accept the local-network prompt if iOS shows one.
 4. Open the native sender app on the Mac:
 
    ```sh
    ./send
    ```
 
-   The discovered iPhone is selected automatically. Click **Connect**.
+   The discovered iPhone is selected automatically. Click **Connect**. On the
+   first connection, compare the six-digit code in both apps and tap **Pair**
+   on the phone. The trust record is remembered for automatic reconnection.
 5. If local discovery is blocked by a VPN, guest Wi-Fi, or hotspot isolation,
-   choose **Manual address…** and enter an IP that the Mac can reach. Tailscale
-   addresses work through this fallback.
+   choose **Manual address…** and enter an IP that the Mac can reach. Built-in
+   remote rendezvous and relay routing are planned but are not active yet.
 6. For terminal diagnostics, the equivalent command is:
 
    ```sh
@@ -65,7 +67,7 @@ bundle identifier.
    prompts; this is separate from audio-capture permission.
 
 The CLI reports the capture sample rate and fixed 48 kHz wire rate at startup.
-The sender prints capture, packet, capture-drop, and sender-failure counters.
+The sender prints capture, packet, heartbeat, capture-drop, and sender-failure counters.
 The iPhone shows raw datagrams, decoded audio packets, FEC recovery, loss,
 concealment, hard resyncs, audio underruns, and buffered duration.
 
@@ -76,7 +78,13 @@ concealment, hard resyncs, audio underruns, and buffered duration.
 - Mac capture uses `AudioHardwareCreateProcessTap`, a private aggregate audio
   device, and `AudioDeviceCreateIOProcIDWithBlock`.
 - Core Audio process taps require macOS 14.2 or later.
-- Bonjour discovery on local networks, with manual IP/Tailscale fallback.
+- Bonjour discovery on local networks, with a manual reachable-IP fallback.
+- Stable receiver identity and capability TXT metadata; names and IP addresses
+  are not treated as identity.
+- Receiver-approved first-use pairing, remembered trust, acknowledged
+  connection setup, one-second heartbeats, and automatic reconnection.
+- X25519 device-key pinning and authenticated XChaCha20-Poly1305 encryption for
+  audio, heartbeats, and remote media controls.
 - Audio uses the selected UDP port (`48101` by default). The three fixed remote
   control commands return on the next UDP port (`48102` by default); no
   arbitrary input is executed.
@@ -90,9 +98,9 @@ concealment, hard resyncs, audio underruns, and buffered duration.
   physical playback is not yet validated. Disconnect and reconnect after a
   Mac device/sample-rate change; automatic live format reconfiguration is
   still future work.
-- The receiver uses a 60 ms audio-ring prebuffer and a 12-packet jitter
-  threshold, plus conversion, network, and device-output latency. Its displayed
-  buffered duration counts only the audio ring, not end-to-end latency.
+- Roughly 60 ms receiver prebuffer, plus network/jitter and device-output
+  latency. The iPhone UI offers 40/60/100/160 ms presets.
+- The iPhone has app volume control and the system AirPlay/output route picker.
 - iOS background audio mode is enabled, so an active stream can continue while
   using other apps or while the phone is locked. Force-quitting SoundMux still
   stops the receiver,

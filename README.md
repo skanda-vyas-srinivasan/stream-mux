@@ -1,7 +1,5 @@
 # SoundMux
 
-## IN PROGRESS
-
 SoundMux is a peer-to-peer audio-routing app that sends audio between devices
 over a local network and plays it through the receiver's selected speakers,
 headphones, or AirPods.
@@ -41,10 +39,23 @@ cover 32, 44.1, 48, 88.2, 96, and 192 kHz. Physical validation of non-48-kHz
 capture remains pending.
 
 The portable C++20 core provides reusable sender and receiver engines around
-packet serialization, stream epochs, UDP adapters, jitter buffering, an audio
-ring buffer, hard resynchronization, and 10-data + 5-parity erasure coding.
-Apple capture, networking policy, and playback integrations remain thin
-platform adapters outside the portable transport engines.
+packet serialization, stream epochs, UDP adapters for POSIX and Winsock,
+jitter buffering, an audio ring buffer, hard resynchronization, a portable
+session protocol, and 10-data + 5-parity erasure coding. Platform capture and
+playback integrations remain thin adapters outside the transport engines.
+
+Receivers advertise a stable device UUID, user-facing name, platform, protocol
+versions, and capabilities. The first connection requires approval on the
+receiver with a matching six-digit code. Long-term X25519 public keys are then
+pinned to the stable device IDs. Each connection derives fresh directional
+keys and encrypts audio, heartbeats, and media commands with authenticated
+XChaCha20-Poly1305 envelopes. Trusted devices reconnect automatically and
+heartbeats prevent a UDP socket from being mistaken for a live connection.
+
+The connection planner keeps local discovery, remembered addresses, future
+rendezvous results, and relay routes separate from the audio engine. The
+rendezvous and relay services themselves are not deployed yet; current builds
+still require a directly reachable LAN address.
 
 ## Build
 
@@ -56,18 +67,22 @@ ctest --test-dir build --output-on-failure
 ./build/macos/MultiAudioMac/multipoint_receiver 48100 100
 ```
 
-For Mac-to-iPhone streaming, install and open the iOS app. It starts listening
-on UDP port `48101` and advertises itself automatically. Then open the native
-**SoundMux Sender** Mac app with:
+Open the unified native **SoundMux** Mac app with:
 
 ```sh
 ./send
 ```
 
-On the same local network, the Mac discovers and selects **SoundMux iPhone**;
-click **Connect**. If Bonjour is unavailable across a VPN or isolated hotspot,
-choose **Manual address…** and enter the iPhone's reachable IP. The command-line
-equivalent remains available for diagnostics:
+Use **Send Audio** to discover an iPhone, Mac, or compatible Windows receiver,
+then click **Connect**. Use **Receive Audio** to make the Mac discoverable and
+play incoming audio through its current system output. Receiver mode includes
+latency presets, volume, remembered pairing, and optional automatic startup.
+
+On first use, confirm the same pairing code on both devices and approve it on
+the receiver. Later launches reconnect automatically. If Bonjour is unavailable
+across a VPN or isolated hotspot, choose **Manual address…** and enter the
+receiver's reachable IP. The command-line sender remains available for
+diagnostics:
 
 ```sh
 ./build/macos/MultiAudioMac/multipoint_mac_sender <iphone-ip> 48101
@@ -82,6 +97,24 @@ Accessibility permission. See
 The iOS receiver declares background audio playback, so an active stream keeps
 playing when SoundMux is backgrounded or the phone is locked. It cannot keep
 running after the user force-quits the app.
+
+For Mac-to-Mac use, select **Receive Audio** on the destination Mac and click
+**Make This Mac Available**. The sending Mac discovers it automatically. The
+receiver filters its own identity to prevent a same-Mac feedback loop.
+
+The terminal receiver remains available for diagnostics:
+
+```sh
+./build/macos/MultiAudioMac/multipoint_receiver 48100 60
+```
+
+It advertises itself as a macOS receiver and prints the first-use comparison
+code in the terminal.
+
+The portable core now builds on Windows with Winsock. The intended
+Sonexis-Windows integration copies post-DSP APO samples into a lock-free ring
+and performs SoundMux networking in a separate worker process—never inside
+`audiodg.exe`. See [docs/session-protocol.md](docs/session-protocol.md).
 
 Use `./run` for the default receiver port `48100` and `100` ms latency, or
 `./run <port> <latency-ms>` to override them. Use `./stop` to stop this

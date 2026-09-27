@@ -3,7 +3,7 @@
 set -euo pipefail
 
 script_dir="${0:A:h}"
-sender_app="$script_dir/build/macos/MultiAudioMac/SoundMux Sender.app"
+sender_app="$script_dir/build/macos/MultiAudioMac/SoundMux.app"
 
 if (( $# != 0 )); then
     print -u2 "Usage: send"
@@ -11,7 +11,7 @@ if (( $# != 0 )); then
 fi
 
 if [[ ! -d "$sender_app" ]]; then
-    print -u2 "SoundMux Sender is not built. Run the project build first."
+    print -u2 "SoundMux is not built. Run the project build first."
     exit 1
 fi
 

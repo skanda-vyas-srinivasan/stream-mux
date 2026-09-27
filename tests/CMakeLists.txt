@@ -1,8 +1,12 @@
 add_executable(multipoint_core_tests test_main.cpp)
 target_link_libraries(multipoint_core_tests PRIVATE multipoint_core)
-target_compile_options(multipoint_core_tests PRIVATE
-    -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
-)
+if(MSVC)
+    target_compile_options(multipoint_core_tests PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(multipoint_core_tests PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
+    )
+endif()
 add_test(NAME multipoint_core_tests COMMAND multipoint_core_tests)
 
 if(APPLE)

@@ -12,6 +12,8 @@
     <string>6.0</string>
     <key>CFBundleName</key>
     <string>${MACOSX_BUNDLE_BUNDLE_NAME}</string>
+    <key>CFBundleDisplayName</key>
+    <string>SoundMux</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -23,7 +25,7 @@
     <key>NSAudioCaptureUsageDescription</key>
     <string>SoundMux captures Mac system audio so it can play on your selected receiver.</string>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>SoundMux discovers nearby iPhones and sends system audio to the selected receiver.</string>
+    <string>SoundMux discovers nearby devices and sends or receives audio on your local network.</string>
     <key>NSBonjourServices</key>
     <array>
         <string>_soundmux._udp</string>

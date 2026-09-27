@@ -112,10 +112,53 @@ UdpReceiver::~UdpReceiver() {
 }
 
 std::size_t UdpReceiver::receive(std::span<std::byte> destination) {
-    const auto received = recv(fd_, destination.data(), destination.size(), 0);
-    if (received >= 0) return static_cast<std::size_t>(received);
+    UdpEndpoint source;
+    return receive_from(destination, source);
+}
+
+std::size_t UdpReceiver::receive_from(
+    std::span<std::byte> destination,
+    UdpEndpoint& source) {
+    static_assert(sizeof(sockaddr_storage) <= sizeof(source.storage));
+    sockaddr_storage address{};
+    socklen_t address_size = sizeof(address);
+    const auto received = recvfrom(
+        fd_, destination.data(), destination.size(), 0,
+        reinterpret_cast<sockaddr*>(&address), &address_size);
+    if (received >= 0) {
+        std::memcpy(source.storage.data(), &address, address_size);
+        source.size = address_size;
+        return static_cast<std::size_t>(received);
+    }
     if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 0;
     throw socket_error("receive UDP datagram");
+}
+
+void UdpReceiver::send_to(
+    std::span<const std::byte> datagram,
+    const UdpEndpoint& destination,
+    std::uint16_t port_override) {
+    if (destination.size == 0 || destination.size > destination.storage.size()) {
+        throw std::invalid_argument("invalid UDP endpoint");
+    }
+    sockaddr_storage address{};
+    std::memcpy(&address, destination.storage.data(), destination.size);
+    if (port_override != 0) {
+        if (address.ss_family == AF_INET) {
+            reinterpret_cast<sockaddr_in*>(&address)->sin_port = htons(port_override);
+        } else if (address.ss_family == AF_INET6) {
+            reinterpret_cast<sockaddr_in6*>(&address)->sin6_port = htons(port_override);
+        } else {
+            throw std::invalid_argument("unsupported UDP endpoint family");
+        }
+    }
+    const auto sent = sendto(
+        fd_, datagram.data(), datagram.size(), 0,
+        reinterpret_cast<const sockaddr*>(&address),
+        static_cast<socklen_t>(destination.size));
+    if (sent < 0 || static_cast<std::size_t>(sent) != datagram.size()) {
+        throw socket_error("send UDP datagram");
+    }
 }
 
 }  // namespace multipoint::network
