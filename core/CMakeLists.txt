@@ -6,6 +6,8 @@ add_library(multipoint_core STATIC
     protocol/session_crypto.cpp
     jitter/jitter_buffer.cpp
     network/connection_plan.cpp
+    network/relay_envelope.cpp
+    transport/adaptive_controller.cpp
     transport/receiver_engine.cpp
     transport/sender_engine.cpp
 )
@@ -15,6 +17,15 @@ if(WIN32)
     target_link_libraries(multipoint_core PUBLIC ws2_32 bcrypt)
 else()
     target_sources(multipoint_core PRIVATE network/udp_socket_posix.cpp)
+endif()
+
+add_executable(soundmux_relay network/relay_server.cpp)
+target_link_libraries(soundmux_relay PRIVATE multipoint_core)
+if(MSVC)
+    target_compile_options(soundmux_relay PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(soundmux_relay PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
 endif()
 
 target_include_directories(multipoint_core

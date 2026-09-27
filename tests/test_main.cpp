@@ -1,11 +1,13 @@
 #include "multipoint/audio/spsc_audio_ring.h"
 #include "multipoint/jitter/jitter_buffer.h"
 #include "multipoint/network/connection_plan.h"
+#include "multipoint/network/relay_envelope.h"
 #include "multipoint/protocol/audio_packet.h"
 #include "multipoint/protocol/fec.h"
 #include "multipoint/protocol/session.h"
 #include "multipoint/protocol/session_crypto.h"
 #include "multipoint/transport/receiver_engine.h"
+#include "multipoint/transport/adaptive_controller.h"
 #include "multipoint/transport/sender_engine.h"
 #include "multipoint/util/sequence.h"
 
@@ -208,6 +210,74 @@ void test_connection_plan_prefers_direct_paths_and_deduplicates() {
             "connection plan did not try remembered direct address second");
     require(plan.back().route == ConnectionRoute::relay,
             "connection plan did not leave relay as final fallback");
+}
+
+void test_relay_envelope_round_trip_and_rejection() {
+    using namespace multipoint::network;
+    RelayRoute route{};
+    for (std::size_t index = 0; index < route.size(); ++index) {
+        route[index] = static_cast<std::byte>(index + 1);
+    }
+    const std::vector<std::byte> payload = {
+        std::byte{1}, std::byte{2}, std::byte{3},
+    };
+    const auto encoded = serialize_relay({
+        .type = RelayMessageType::data_to_receiver,
+        .route = route,
+        .payload = payload,
+    });
+    const auto decoded = deserialize_relay(encoded);
+    require(decoded.valid, "relay envelope did not decode");
+    require(decoded.envelope.type == RelayMessageType::data_to_receiver,
+            "relay envelope type changed");
+    require(decoded.envelope.route == route && decoded.envelope.payload == payload,
+            "relay envelope content changed");
+    RelayRoute parsed{};
+    require(parse_relay_route(relay_route_text(route), parsed) && parsed == route,
+            "relay route text did not round trip");
+
+    auto reserved = encoded;
+    reserved[5] = std::byte{1};
+    require(!deserialize_relay(reserved).valid,
+            "relay accepted nonzero reserved bytes");
+    const auto invalid_control = std::vector<std::byte>(encoded.begin(), encoded.end());
+    auto control = invalid_control;
+    control[4] = static_cast<std::byte>(
+        static_cast<std::uint8_t>(RelayMessageType::register_receiver));
+    require(!deserialize_relay(control).valid,
+            "relay accepted a control-message payload");
+}
+
+void test_adaptive_controller_uses_hysteresis() {
+    using namespace multipoint::transport;
+    AdaptiveController controller(AdaptiveProfile::responsive);
+    const NetworkInterval bad{
+        .packets_received = 980,
+        .packets_lost = 20,
+        .audio_underruns = 1,
+        .maximum_arrival_gap_ms = 120,
+        .round_trip_ms = 280,
+    };
+    require(!controller.observe(bad).changed,
+            "adaptive controller reacted to one bad interval");
+    auto decision = controller.observe(bad);
+    require(decision.changed && decision.profile == AdaptiveProfile::balanced,
+            "adaptive controller did not protect a degrading stream");
+
+    const NetworkInterval good{
+        .packets_received = 1'000,
+        .packets_lost = 0,
+        .audio_underruns = 0,
+        .maximum_arrival_gap_ms = 8,
+        .round_trip_ms = 35,
+    };
+    for (int index = 0; index < 19; ++index) {
+        require(!controller.observe(good).changed,
+                "adaptive controller reduced protection too quickly");
+    }
+    decision = controller.observe(good);
+    require(decision.changed && decision.profile == AdaptiveProfile::responsive,
+            "adaptive controller did not restore low latency after stability");
 }
 
 void test_sender_engine_packetization_and_epoch_reset() {
@@ -455,6 +525,8 @@ int main() {
         test_session_protocol_round_trip_and_rejection();
         test_encrypted_session_round_trip_and_tamper_rejection();
         test_connection_plan_prefers_direct_paths_and_deduplicates();
+        test_relay_envelope_round_trip_and_rejection();
+        test_adaptive_controller_uses_hysteresis();
         test_sender_engine_packetization_and_epoch_reset();
         test_receiver_engine_fec_and_epoch_rejection();
         test_receiver_engine_sequence_gap_resync();
