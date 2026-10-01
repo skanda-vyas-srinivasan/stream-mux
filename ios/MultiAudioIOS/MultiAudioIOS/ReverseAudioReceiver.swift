@@ -4,11 +4,11 @@ import Network
 import Security
 import UIKit
 
-private let soundMuxCryptoKeyBytes = 32
-private let soundMuxCryptoNonceBytes = 16
-private let soundMuxCryptoProofBytes = 32
+let soundMuxCryptoKeyBytes = 32
+let soundMuxCryptoNonceBytes = 16
+let soundMuxCryptoProofBytes = 32
 
-private struct SoundMuxDeviceKey {
+struct SoundMuxDeviceKey {
     let secret: Data
     let publicKey: Data
 
@@ -70,7 +70,7 @@ private struct SoundMuxDeviceKey {
     }
 }
 
-private struct SoundMuxSessionSecrets {
+struct SoundMuxSessionSecrets {
     let senderKey: Data
     let receiverKey: Data
     let senderNonce: Data
@@ -139,7 +139,7 @@ private struct SoundMuxSessionSecrets {
     }
 }
 
-private final class SoundMuxCipher: @unchecked Sendable {
+final class SoundMuxCipher: @unchecked Sendable {
     enum OpenResult { case notEncrypted, invalid, plaintext(Data) }
     private var reference: MPSessionCipherRef?
 
@@ -203,7 +203,7 @@ private final class SoundMuxCipher: @unchecked Sendable {
     }
 }
 
-private extension Data {
+extension Data {
     var soundMuxHex: String { map { String(format: "%02x", $0) }.joined() }
 
     static func soundMuxHex(_ text: String, count: Int) -> Data? {
@@ -249,7 +249,7 @@ private struct SoundMuxRelayConfiguration: Sendable {
     let route: String
 }
 
-private enum SoundMuxSessionKind: String {
+enum SoundMuxSessionKind: String {
     case hello = "HELLO"
     case pairRequired = "PAIR_REQUIRED"
     case rejected = "REJECTED"
@@ -259,7 +259,7 @@ private enum SoundMuxSessionKind: String {
     case profile = "PROFILE"
 }
 
-private struct SoundMuxSessionMessage {
+struct SoundMuxSessionMessage {
     let kind: SoundMuxSessionKind
     let fields: [String: String]
 

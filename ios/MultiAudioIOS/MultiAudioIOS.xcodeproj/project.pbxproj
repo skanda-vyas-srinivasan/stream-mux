@@ -24,6 +24,7 @@
 		AA000001000000000000020F /* monocypher.c in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000113 /* monocypher.c */; };
 		AA0000010000000000000210 /* relay_envelope.cpp in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000114 /* relay_envelope.cpp */; };
 		AA0000010000000000000211 /* relay_channel.cpp in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000115 /* relay_channel.cpp */; };
+		AA0000010000000000000212 /* MicrophoneCaptureManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000116 /* MicrophoneCaptureManager.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -48,6 +49,7 @@
 		AA0000010000000000000113 /* monocypher.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; name = monocypher.c; path = ../../third_party/monocypher/monocypher.c; sourceTree = SOURCE_ROOT; };
 		AA0000010000000000000114 /* relay_envelope.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = relay_envelope.cpp; path = ../../core/network/relay_envelope.cpp; sourceTree = SOURCE_ROOT; };
 		AA0000010000000000000115 /* relay_channel.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = relay_channel.cpp; path = ../../core/network/relay_channel.cpp; sourceTree = SOURCE_ROOT; };
+		AA0000010000000000000116 /* MicrophoneCaptureManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MicrophoneCaptureManager.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -83,6 +85,7 @@
 				AA0000010000000000000101 /* MultiAudioIOSApp.swift */,
 				AA0000010000000000000102 /* ContentView.swift */,
 				AA0000010000000000000103 /* CaptureManager.swift */,
+				AA0000010000000000000116 /* MicrophoneCaptureManager.swift */,
 				AA0000010000000000000107 /* AudioTransport.swift */,
 				AA000001000000000000010F /* ReverseAudioReceiver.swift */,
 				AA000001000000000000010B /* USBMetricLogger.swift */,
@@ -189,6 +192,7 @@
 				AA000001000000000000020F /* monocypher.c in Sources */,
 				AA0000010000000000000210 /* relay_envelope.cpp in Sources */,
 				AA0000010000000000000211 /* relay_channel.cpp in Sources */,
+				AA0000010000000000000212 /* MicrophoneCaptureManager.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

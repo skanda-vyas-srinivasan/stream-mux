@@ -528,6 +528,27 @@ private struct ExperimentalSenderView: View {
     @EnvironmentObject private var capture: CaptureManager
 
     var body: some View {
+        List {
+            NavigationLink {
+                SystemAudioSenderView()
+                    .environmentObject(capture)
+            } label: {
+                Label("Send iPhone System Audio", systemImage: "iphone.and.arrow.forward")
+            }
+            NavigationLink {
+                MicrophoneSenderView()
+            } label: {
+                Label("Use iPhone as Mac Microphone", systemImage: "mic.and.signal.meter")
+            }
+        }
+        .navigationTitle("iPhone → Mac")
+    }
+}
+
+private struct SystemAudioSenderView: View {
+    @EnvironmentObject private var capture: CaptureManager
+
+    var body: some View {
         Form {
             Section("Destination") {
                 TextField("Mac IP address", text: $capture.receiverHost)
@@ -557,12 +578,12 @@ private struct ExperimentalSenderView: View {
                         Task { await capture.stopCapture() }
                     }
                 } else {
-                    Button("Start Experimental Stream") {
+                    Button("Start System Audio Stream") {
                         capture.startStreaming()
                     }
                 }
             } footer: {
-                Text("This direction still uses Apple's display-sharing audio picker.")
+                Text("Uses Apple's display-sharing audio picker. Only audio is transported; SoundMux does not send screen frames.")
             }
 
             if let error = capture.errorMessage {
@@ -571,6 +592,56 @@ private struct ExperimentalSenderView: View {
                 }
             }
         }
-        .navigationTitle("iPhone → Mac")
+        .navigationTitle("System Audio")
+    }
+}
+
+private struct MicrophoneSenderView: View {
+    @StateObject private var capture = MicrophoneCaptureManager()
+
+    var body: some View {
+        Form {
+            Section("Destination") {
+                TextField("Mac IP address", text: $capture.receiverHost)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                TextField("UDP port", text: $capture.receiverPort)
+                    .keyboardType(.numberPad)
+                LabeledContent("Network", value: capture.transportState)
+            }
+
+            Section("Microphone") {
+                LabeledContent("Status", value: capture.status)
+                LabeledContent("Buffers", value: capture.audioBufferCount.formatted())
+                LabeledContent("Packets sent", value: capture.packetsSent.formatted())
+                LabeledContent("Queue drops", value: capture.queueDrops.formatted())
+                if let format = capture.latestFormat {
+                    LabeledContent("Format", value: format)
+                    LabeledContent("RMS level", value: capture.latestRMSLevel)
+                    LabeledContent("Peak level", value: capture.latestPeakLevel)
+                }
+            }
+
+            Section {
+                if capture.isCapturing {
+                    Button("Stop Microphone", role: .destructive) {
+                        Task { await capture.stopCapture() }
+                    }
+                } else {
+                    Button("Use iPhone as Mac Microphone") {
+                        capture.startStreaming()
+                    }
+                }
+            } footer: {
+                Text("On the Mac, select a virtual audio device such as BlackHole as the receiver output, then select that device as the microphone in your call or recording app.")
+            }
+
+            if let error = capture.errorMessage {
+                Section("Error") {
+                    Text(error).foregroundStyle(.red)
+                }
+            }
+        }
+        .navigationTitle("Mac Microphone")
     }
 }

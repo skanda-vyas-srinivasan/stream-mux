@@ -11,6 +11,9 @@ struct MacReceiverConfig {
     std::uint32_t latency_ms = 60;
     std::string device_id;
     std::string device_name;
+    // Empty uses the system default output. A Core Audio device UID routes
+    // received audio directly to that device (for example BlackHole 2ch).
+    std::string output_device_uid;
 };
 
 struct MacReceiverSnapshot {

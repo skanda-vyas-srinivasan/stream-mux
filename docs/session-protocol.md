@@ -54,6 +54,9 @@ sender                                  receiver
 
 `HELLO` includes `device_id`, `name`, `platform`, the sender `public_key`, a
 fresh `client_nonce`, `reply_port`, `protocol`, `session`, and `pair_requested`.
+For a connected UDP socket, `reply_port=0` asks the receiver to reply to the
+source endpoint of the HELLO datagram. A nonzero value overrides that source
+port for clients that listen for controls on a separate socket.
 The last field lets a sender that deliberately forgot a device request a fresh
 comparison even when the receiver still has one-sided trust. The receiver
 answers with its public key and a fresh `server_nonce`. Both endpoints derive

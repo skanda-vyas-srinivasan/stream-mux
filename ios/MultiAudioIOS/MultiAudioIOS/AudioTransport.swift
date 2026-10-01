@@ -288,6 +288,32 @@ final class AudioTransportPipeline: @unchecked Sendable {
         return snapshot()
     }
 
+    func submitInterleavedFloatStereo48k(
+        _ samples: [Float],
+        callbackTimestampNS timestamp: UInt64,
+        completion: @escaping @Sendable (TransportSnapshot) -> Void
+    ) {
+        processingQueue.async { [weak self] in
+            guard let self else { return }
+            let frameCount = UInt64(samples.count / 2)
+            self.statsLock.withLock {
+                if self.firstHostTimeNS == nil {
+                    self.firstHostTimeNS = timestamp
+                    self.firstFrameCount = frameCount
+                }
+                if let last = self.lastHostTimeNS {
+                    self.maxCallbackGapNS = max(self.maxCallbackGapNS, timestamp - last)
+                }
+                self.lastHostTimeNS = timestamp
+                self.totalFrames &+= frameCount
+            }
+            for datagram in self.packetizer.consume(samples, senderTimestampNS: timestamp) {
+                self.sender.enqueue(datagram)
+            }
+            completion(self.snapshot())
+        }
+    }
+
     func snapshot() -> TransportSnapshot {
         let network = sender.snapshot()
         let diagnostics = statsLock.withLock {
@@ -427,6 +453,15 @@ private final class UDPAudioSender: @unchecked Sendable {
     private var drainScheduled = false
     private var state = "Stopped"
     private var connection: NWConnection?
+    private var helloTimer: DispatchSourceTimer?
+    private var deviceKey: SoundMuxDeviceKey?
+    private var clientNonce: Data?
+    private var outboundCipher: SoundMuxCipher?
+    private var inboundCipher: SoundMuxCipher?
+    private var pairingReceiverKey: Data?
+    private var pairingServerNonce: Data?
+    private var pairingConfirmed = false
+    private var expectedReceiverID: String?
 
     init(capacity: Int) {
         slots = Array(repeating: nil, count: capacity)
@@ -435,6 +470,31 @@ private final class UDPAudioSender: @unchecked Sendable {
 
     func start(host: String, port: UInt16) {
         stop()
+        let defaults = UserDefaults.standard
+        let deviceID: String
+        if let saved = defaults.string(forKey: "microphoneSenderDeviceID") {
+            deviceID = saved
+        } else {
+            deviceID = UUID().uuidString
+            defaults.set(deviceID, forKey: "microphoneSenderDeviceID")
+        }
+        do {
+            deviceKey = try SoundMuxDeviceKey.loadOrCreate(deviceID: "mic-sender-\(deviceID)")
+        } catch {
+            lock.withLock { state = "Security unavailable: \(error.localizedDescription)" }
+            return
+        }
+        clientNonce = Data.soundMuxRandom(count: soundMuxCryptoNonceBytes)
+        guard clientNonce != nil else {
+            lock.withLock { state = "Security unavailable: could not create session nonce" }
+            return
+        }
+        expectedReceiverID = defaults.string(forKey: "microphoneLastReceiverID")
+        outboundCipher = nil
+        inboundCipher = nil
+        pairingReceiverKey = nil
+        pairingServerNonce = nil
+        pairingConfirmed = false
         lock.withLock {
             head = 0
             tail = 0
@@ -471,7 +531,12 @@ private final class UDPAudioSender: @unchecked Sendable {
                 case .preparing:
                     self.state = "Preparing route"
                 case .ready:
-                    self.state = "Ready"
+                    self.state = "Contacting Mac receiver"
+                    self.startHandshakeTimer(
+                        connection: newConnection,
+                        deviceID: deviceID
+                    )
+                    self.receiveNext(on: newConnection)
                 case .waiting(let error):
                     self.state = "Waiting: \(error)"
                 case .failed(let error):
@@ -491,9 +556,13 @@ private final class UDPAudioSender: @unchecked Sendable {
 
     func stop() {
         queue.sync {
+            helloTimer?.cancel()
+            helloTimer = nil
             connection?.stateUpdateHandler = nil
             connection?.cancel()
             connection = nil
+            outboundCipher = nil
+            inboundCipher = nil
         }
         lock.withLock {
             drainScheduled = false
@@ -565,12 +634,24 @@ private final class UDPAudioSender: @unchecked Sendable {
             lock.withLock { drainScheduled = false }
             return
         }
+        guard let outboundCipher else {
+            lock.withLock { drainScheduled = false }
+            return
+        }
         guard let datagram = dequeueForDrain() else {
             lock.withLock { drainScheduled = false }
             return
         }
 
-        connection.send(content: datagram, completion: .contentProcessed {
+        guard let sealed = outboundCipher.seal(datagram) else {
+            lock.withLock {
+                sendFailures &+= 1
+                drainScheduled = false
+                state = "Encryption failed"
+            }
+            return
+        }
+        connection.send(content: sealed, completion: .contentProcessed {
             [weak self, weak connection] error in
             guard let self, let connection,
                   self.connection === connection else { return }
@@ -592,7 +673,7 @@ private final class UDPAudioSender: @unchecked Sendable {
                 }
                 self.lastSendTimeNS = now
                 self.packetsSent &+= 1
-                self.state = "Ready"
+                self.state = "Secure microphone stream"
             }
             self.drainAvailablePackets()
         })
@@ -606,6 +687,204 @@ private final class UDPAudioSender: @unchecked Sendable {
             head = (head + 1) % slots.count
             count -= 1
             return datagram
+        }
+    }
+
+    private func startHandshakeTimer(connection: NWConnection, deviceID: String) {
+        helloTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .seconds(1))
+        timer.setEventHandler { [weak self, weak connection] in
+            guard let self, let connection, self.connection === connection,
+                  self.outboundCipher == nil,
+                  let key = self.deviceKey,
+                  let nonce = self.clientNonce else { return }
+            let trusted = self.expectedReceiverID.flatMap { self.trustedReceiverKey(id: $0) }
+            let hello = SoundMuxSessionMessage(kind: .hello, fields: [
+                "device_id": deviceID,
+                "name": "iPhone microphone",
+                "platform": "ios",
+                "public_key": key.publicKey.soundMuxHex,
+                "client_nonce": nonce.soundMuxHex,
+                // A connected UDP socket receives replies on its source port.
+                "reply_port": "0",
+                "protocol": "3",
+                "session": "3",
+                "pair_requested": trusted == nil ? "1" : "0",
+            ])
+            connection.send(content: hello.data, completion: .idempotent)
+        }
+        helloTimer = timer
+        timer.resume()
+    }
+
+    private func receiveNext(on connection: NWConnection) {
+        connection.receiveMessage { [weak self, weak connection] data, _, _, error in
+            guard let self, let connection, self.connection === connection else { return }
+            if let data { self.handleIncoming(data, connection: connection) }
+            if let error {
+                self.lock.withLock { self.state = "Receive failed: \(error)" }
+                return
+            }
+            self.receiveNext(on: connection)
+        }
+    }
+
+    private func handleIncoming(_ data: Data, connection: NWConnection) {
+        if let message = SoundMuxSessionMessage.decode(data) {
+            handleHandshake(message, connection: connection)
+            return
+        }
+        guard let inboundCipher else { return }
+        if case .plaintext(let plaintext) = inboundCipher.open(data),
+           let message = SoundMuxSessionMessage.decode(plaintext),
+           message.kind == .rejected {
+            lock.withLock {
+                state = message.fields["reason"] ?? "Receiver rejected the session"
+            }
+        }
+    }
+
+    private func handleHandshake(
+        _ message: SoundMuxSessionMessage,
+        connection: NWConnection
+    ) {
+        switch message.kind {
+        case .pairRequired:
+            guard let publicText = message.fields["public_key"],
+                  let publicKey = Data.soundMuxHex(
+                    publicText, count: soundMuxCryptoKeyBytes),
+                  let nonceText = message.fields["server_nonce"],
+                  let serverNonce = Data.soundMuxHex(
+                    nonceText, count: soundMuxCryptoNonceBytes),
+                  let deviceKey,
+                  let receiverID = message.fields["receiver_id"] else { return }
+            if let trusted = trustedReceiverKey(id: receiverID), trusted != publicKey {
+                lock.withLock { state = "Mac security key changed; forget it before reconnecting" }
+                return
+            }
+            guard let expectedCode = pairingCode(
+                sender: deviceKey.publicKey, receiver: publicKey),
+                  message.fields["code"] == nil || message.fields["code"] == expectedCode else {
+                lock.withLock { state = "Receiver pairing code was not authentic" }
+                return
+            }
+            pairingReceiverKey = publicKey
+            pairingServerNonce = serverNonce
+            pairingConfirmed = true
+            expectedReceiverID = receiverID
+            lock.withLock { state = "Compare code \(expectedCode), then approve on Mac" }
+
+        case .welcome:
+            guard let receiverID = message.fields["receiver_id"],
+                  let publicText = message.fields["public_key"],
+                  let publicKey = Data.soundMuxHex(
+                    publicText, count: soundMuxCryptoKeyBytes),
+                  let nonceText = message.fields["server_nonce"],
+                  let serverNonce = Data.soundMuxHex(
+                    nonceText, count: soundMuxCryptoNonceBytes),
+                  let proofText = message.fields["proof"],
+                  let proof = Data.soundMuxHex(
+                    proofText, count: soundMuxCryptoProofBytes),
+                  let deviceKey, let clientNonce else { return }
+            if let trusted = trustedReceiverKey(id: receiverID) {
+                guard trusted == publicKey else {
+                    lock.withLock { state = "Mac security key changed; connection blocked" }
+                    return
+                }
+            } else {
+                guard pairingConfirmed,
+                      pairingReceiverKey == publicKey,
+                      pairingServerNonce == serverNonce else {
+                    lock.withLock { state = "Mac was not securely paired" }
+                    return
+                }
+            }
+            guard let secrets = SoundMuxSessionSecrets.derive(
+                localSecret: deviceKey.secret,
+                remotePublic: publicKey,
+                senderPublic: deviceKey.publicKey,
+                receiverPublic: publicKey,
+                clientNonce: clientNonce,
+                serverNonce: serverNonce
+            ), proofMatches(expected: secrets.proof, received: proof),
+               let outbound = SoundMuxCipher(
+                    key: secrets.senderKey, nonce: secrets.senderNonce),
+               let inbound = SoundMuxCipher(
+                    key: secrets.receiverKey, nonce: secrets.receiverNonce) else {
+                lock.withLock { state = "Receiver authentication failed" }
+                return
+            }
+            outboundCipher = outbound
+            inboundCipher = inbound
+            expectedReceiverID = receiverID
+            rememberReceiverKey(
+                id: receiverID,
+                name: message.fields["receiver_name"] ?? "Mac",
+                key: publicKey
+            )
+            helloTimer?.cancel()
+            helloTimer = nil
+            lock.withLock { state = "Secure microphone stream" }
+            // Audio captured while the user was comparing the pairing code is
+            // stale. Start with the next live microphone packet rather than
+            // blasting that backlog into the receiver.
+            discardQueued()
+
+        case .rejected:
+            lock.withLock {
+                state = message.fields["reason"] ?? "Mac rejected the connection"
+            }
+        default:
+            break
+        }
+    }
+
+    private func trustedReceiverKey(id: String) -> Data? {
+        let keys = UserDefaults.standard.dictionary(
+            forKey: "microphoneTrustedReceiverKeys") as? [String: String]
+        guard let encoded = keys?[id] else { return nil }
+        return Data.soundMuxHex(encoded, count: soundMuxCryptoKeyBytes)
+    }
+
+    private func rememberReceiverKey(id: String, name: String, key: Data) {
+        let defaults = UserDefaults.standard
+        var keys = defaults.dictionary(
+            forKey: "microphoneTrustedReceiverKeys") as? [String: String] ?? [:]
+        var names = defaults.dictionary(
+            forKey: "microphoneTrustedReceiverNames") as? [String: String] ?? [:]
+        keys[id] = key.soundMuxHex
+        names[id] = name
+        defaults.set(keys, forKey: "microphoneTrustedReceiverKeys")
+        defaults.set(names, forKey: "microphoneTrustedReceiverNames")
+        defaults.set(id, forKey: "microphoneLastReceiverID")
+    }
+
+    private func pairingCode(sender: Data, receiver: Data) -> String? {
+        var code = [CChar](repeating: 0, count: 7)
+        let success = sender.withUnsafeBytes { senderBytes in
+            receiver.withUnsafeBytes { receiverBytes in
+                MPCryptoPairingCode(
+                    senderBytes.bindMemory(to: UInt8.self).baseAddress,
+                    receiverBytes.bindMemory(to: UInt8.self).baseAddress,
+                    &code,
+                    code.count
+                )
+            }
+        }
+        return success
+            ? String(decoding: code.prefix(6).map(UInt8.init), as: UTF8.self)
+            : nil
+    }
+
+    private func proofMatches(expected: Data, received: Data) -> Bool {
+        expected.withUnsafeBytes { expectedBytes in
+            received.withUnsafeBytes { receivedBytes in
+                MPCryptoProofMatches(
+                    expectedBytes.bindMemory(to: UInt8.self).baseAddress,
+                    receivedBytes.bindMemory(to: UInt8.self).baseAddress
+                )
+            }
         }
     }
 }

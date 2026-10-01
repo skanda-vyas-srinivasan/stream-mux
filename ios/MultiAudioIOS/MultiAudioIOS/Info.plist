@@ -24,6 +24,8 @@
 	<string>SoundMux captures screen audio so it can be routed to another device.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>SoundMux discovers nearby devices and streams audio between your Mac and iPhone.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>SoundMux uses your iPhone microphone as an audio input for your Mac.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_soundmux._udp</string>

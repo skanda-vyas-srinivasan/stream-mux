@@ -275,6 +275,84 @@ NSString* local_sender_name() {
     return name.length ? name : @"Mac";
 }
 
+NSArray<NSDictionary*>* available_audio_outputs() {
+    AudioObjectPropertyAddress devices_address{
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain,
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(
+            kAudioObjectSystemObject, &devices_address, 0, nullptr, &size) != noErr) {
+        return @[];
+    }
+    std::vector<AudioDeviceID> devices(size / sizeof(AudioDeviceID));
+    if (AudioObjectGetPropertyData(
+            kAudioObjectSystemObject, &devices_address, 0, nullptr, &size,
+            devices.data()) != noErr) {
+        return @[];
+    }
+    NSMutableArray<NSDictionary*>* outputs = [NSMutableArray array];
+    for (const auto device : devices) {
+        AudioObjectPropertyAddress config_address{
+            kAudioDevicePropertyStreamConfiguration,
+            kAudioDevicePropertyScopeOutput,
+            kAudioObjectPropertyElementMain,
+        };
+        UInt32 config_size = 0;
+        if (AudioObjectGetPropertyDataSize(
+                device, &config_address, 0, nullptr, &config_size) != noErr ||
+            config_size < sizeof(AudioBufferList)) continue;
+        std::vector<std::byte> storage(config_size);
+        auto* buffers = reinterpret_cast<AudioBufferList*>(storage.data());
+        if (AudioObjectGetPropertyData(
+                device, &config_address, 0, nullptr, &config_size, buffers) != noErr) {
+            continue;
+        }
+        UInt32 channels = 0;
+        for (UInt32 index = 0; index < buffers->mNumberBuffers; ++index) {
+            channels += buffers->mBuffers[index].mNumberChannels;
+        }
+        if (channels == 0) continue;
+
+        auto string_property = [device](AudioObjectPropertySelector selector) -> NSString* {
+            AudioObjectPropertyAddress address{
+                selector, kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain,
+            };
+            CFStringRef value = nullptr;
+            UInt32 value_size = sizeof(value);
+            if (AudioObjectGetPropertyData(
+                    device, &address, 0, nullptr, &value_size, &value) != noErr ||
+                !value) return nil;
+            return CFBridgingRelease(value);
+        };
+        NSString* name = string_property(kAudioObjectPropertyName);
+        NSString* uid = string_property(kAudioDevicePropertyDeviceUID);
+        if (!name.length || !uid.length) continue;
+        NSString* lower = name.lowercaseString;
+        const BOOL virtual_device =
+            [lower containsString:@"blackhole"] ||
+            [lower containsString:@"loopback"] ||
+            [lower containsString:@"soundflower"] ||
+            [lower containsString:@"virtual"];
+        [outputs addObject:@{
+            @"name": name,
+            @"uid": uid,
+            @"virtual": @(virtual_device),
+        }];
+    }
+    [outputs sortUsingComparator:^NSComparisonResult(NSDictionary* left, NSDictionary* right) {
+        const BOOL left_virtual = [left[@"virtual"] boolValue];
+        const BOOL right_virtual = [right[@"virtual"] boolValue];
+        if (left_virtual != right_virtual) {
+            return left_virtual ? NSOrderedAscending : NSOrderedDescending;
+        }
+        return [left[@"name"] localizedCaseInsensitiveCompare:right[@"name"]];
+    }];
+    return outputs;
+}
+
 NSDictionary<NSString*, NSData*>* service_metadata(NSNetService* service) {
     NSData* data = service.TXTRecordData;
     return data.length ? [NSNetService dictionaryFromTXTRecordData:data] : @{};
@@ -1048,6 +1126,8 @@ private:
     NSTextField* _receiveNameField;
     NSTextField* _receivePortField;
     NSPopUpButton* _receiveLatencyPopup;
+    NSPopUpButton* _receiveOutputPopup;
+    NSTextField* _receiveOutputHelpLabel;
     NSSlider* _receiveVolumeSlider;
     NSTextField* _receiveVolumeLabel;
     NSButton* _receiveAutoStartButton;
@@ -1410,22 +1490,36 @@ private:
     latency_stack.alignment = NSLayoutAttributeLeading;
     latency_stack.spacing = 4;
 
-    NSTextField* output_label = [NSTextField labelWithString:@"Playback output"];
+    NSTextField* output_label = [NSTextField labelWithString:@"Route received audio to"];
     output_label.font = [NSFont systemFontOfSize:11];
     output_label.textColor = NSColor.secondaryLabelColor;
-    NSTextField* output_value = [NSTextField labelWithString:@"System default output"];
-    output_value.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
-    NSButton* sound_settings = [NSButton buttonWithTitle:@"Sound Settings…"
-                                                   target:self
-                                                   action:@selector(openSoundSettings:)];
-    sound_settings.bezelStyle = NSBezelStyleInline;
-    NSStackView* output_row = [NSStackView stackViewWithViews:@[output_value, sound_settings]];
-    output_row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    output_row.alignment = NSLayoutAttributeCenterY;
-    output_row.spacing = 8;
-    [output_value setContentHuggingPriority:NSLayoutPriorityDefaultLow
-                            forOrientation:NSLayoutConstraintOrientationHorizontal];
-    NSStackView* output_stack = [NSStackView stackViewWithViews:@[output_label, output_row]];
+    _receiveOutputPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    [_receiveOutputPopup addItemWithTitle:@"System default output (speakers)"];
+    _receiveOutputPopup.lastItem.representedObject = @"";
+    for (NSDictionary* output in available_audio_outputs()) {
+        NSString* title = [output[@"virtual"] boolValue]
+            ? [NSString stringWithFormat:@"%@ · Virtual microphone", output[@"name"]]
+            : output[@"name"];
+        [_receiveOutputPopup addItemWithTitle:title];
+        _receiveOutputPopup.lastItem.representedObject = output[@"uid"];
+    }
+    NSString* saved_output_uid = [defaults stringForKey:@"macReceiverOutputUID"];
+    if (saved_output_uid.length) {
+        for (NSMenuItem* item in _receiveOutputPopup.itemArray) {
+            if ([item.representedObject isEqualToString:saved_output_uid]) {
+                [_receiveOutputPopup selectItem:item];
+                break;
+            }
+        }
+    }
+    _receiveOutputHelpLabel = [NSTextField labelWithString:
+        @"To appear as a microphone in other apps, select BlackHole or another virtual audio device here."];
+    _receiveOutputHelpLabel.font = [NSFont systemFontOfSize:11];
+    _receiveOutputHelpLabel.textColor = NSColor.secondaryLabelColor;
+    _receiveOutputHelpLabel.maximumNumberOfLines = 0;
+    NSStackView* output_stack = [NSStackView stackViewWithViews:@[
+        output_label, _receiveOutputPopup, _receiveOutputHelpLabel,
+    ]];
     output_stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     output_stack.alignment = NSLayoutAttributeLeading;
     output_stack.spacing = 4;
@@ -1549,7 +1643,8 @@ private:
         [identity_row.widthAnchor constraintEqualToAnchor:_receiveView.widthAnchor],
         [_receiveLatencyPopup.widthAnchor constraintEqualToConstant:210],
         [output_stack.widthAnchor constraintEqualToAnchor:_receiveView.widthAnchor],
-        [output_row.widthAnchor constraintEqualToAnchor:_receiveView.widthAnchor],
+        [_receiveOutputPopup.widthAnchor constraintEqualToAnchor:_receiveView.widthAnchor],
+        [_receiveOutputHelpLabel.widthAnchor constraintEqualToAnchor:_receiveView.widthAnchor],
         [volume_stack.widthAnchor constraintEqualToAnchor:_receiveView.widthAnchor],
         [volume_row.widthAnchor constraintEqualToAnchor:_receiveView.widthAnchor],
         [_receiveVolumeSlider.widthAnchor constraintGreaterThanOrEqualToConstant:320],
@@ -1636,6 +1731,7 @@ private:
         _receiveNameField.enabled = YES;
         _receivePortField.enabled = YES;
         _receiveLatencyPopup.enabled = YES;
+        _receiveOutputPopup.enabled = YES;
         _receiveButton.title = @"Make This Mac Available";
         _receiveButton.bezelColor = NSColor.systemBlueColor;
         _receiveStatusLabel.stringValue = @"Not available to other devices";
@@ -1659,6 +1755,10 @@ private:
     [defaults setObject:name forKey:@"macReceiverName"];
     [defaults setInteger:port forKey:@"macReceiverPort"];
     [defaults setInteger:latency forKey:@"macReceiverLatency"];
+    NSString* output_uid = [_receiveOutputPopup.selectedItem.representedObject
+        isKindOfClass:NSString.class]
+        ? _receiveOutputPopup.selectedItem.representedObject : @"";
+    [defaults setObject:output_uid forKey:@"macReceiverOutputUID"];
 
     _receiveStatusLabel.stringValue = @"Starting receiver…";
     try {
@@ -1703,6 +1803,7 @@ private:
             .latency_ms = static_cast<std::uint32_t>(latency),
             .device_id = persistent_sender_value(@"soundMuxDeviceID", NO).UTF8String,
             .device_name = name.UTF8String,
+            .output_device_uid = output_uid.UTF8String,
         }, std::move(pairing));
         _receiver->set_volume(static_cast<float>(_receiveVolumeSlider.doubleValue));
     } catch (const std::exception& error) {
@@ -1713,6 +1814,7 @@ private:
     _receiveNameField.enabled = NO;
     _receivePortField.enabled = NO;
     _receiveLatencyPopup.enabled = NO;
+    _receiveOutputPopup.enabled = NO;
     _receiveButton.title = @"Stop Receiving";
     _receiveButton.bezelColor = NSColor.systemRedColor;
     _receiveStatusLabel.stringValue = @"Available nearby";

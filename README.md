@@ -57,6 +57,14 @@ rendezvous results, and relay routes separate from the audio engine. The
 rendezvous and relay services themselves are not deployed yet; current builds
 still require a directly reachable LAN address.
 
+An additional experimental **iPhone microphone to Mac input** path captures the
+phone microphone with AVAudioEngine, converts it to the same encrypted 48 kHz
+transport, and feeds a selected Core Audio output on the Mac. To expose that
+stream as a microphone to Zoom, Discord, a DAW, or another Mac app, install a
+loopback device such as BlackHole, select it under **Receive Audio → Route
+received audio to**, and select the same BlackHole device as the input in the
+destination app. SoundMux does not install or create a system audio driver.
+
 ## Build
 
 ```sh
@@ -75,7 +83,8 @@ Open the unified native **SoundMux** Mac app with:
 
 Use **Send Audio** to discover an iPhone, Mac, or compatible Windows receiver,
 then click **Connect**. Use **Receive Audio** to make the Mac discoverable and
-play incoming audio through its current system output. Receiver mode includes
+route incoming audio through either its current system output or a selected
+Core Audio device. Receiver mode includes
 latency presets, volume, remembered pairing, and optional automatic startup.
 
 On first use, confirm the same pairing code on both devices and approve it on

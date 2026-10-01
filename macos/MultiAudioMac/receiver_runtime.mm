@@ -177,16 +177,59 @@ OSStatus render_audio(
     return noErr;
 }
 
-class DefaultOutput {
+AudioDeviceID audio_device_for_uid(const std::string& uid) {
+    if (uid.empty()) return kAudioObjectUnknown;
+    CFStringRef value = CFStringCreateWithCString(
+        kCFAllocatorDefault, uid.c_str(), kCFStringEncodingUTF8);
+    AudioValueTranslation translation{
+        .mInputData = &value,
+        .mInputDataSize = sizeof(value),
+        .mOutputData = nullptr,
+        .mOutputDataSize = sizeof(AudioDeviceID),
+    };
+    AudioDeviceID device = kAudioObjectUnknown;
+    translation.mOutputData = &device;
+    AudioObjectPropertyAddress address{
+        kAudioHardwarePropertyDeviceForUID,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain,
+    };
+    UInt32 size = sizeof(translation);
+    const auto status = AudioObjectGetPropertyData(
+        kAudioObjectSystemObject, &address, 0, nullptr, &size, &translation);
+    CFRelease(value);
+    if (status != noErr || device == kAudioObjectUnknown) {
+        throw std::runtime_error("selected audio output is no longer available");
+    }
+    return device;
+}
+
+class AudioOutput {
 public:
-    explicit DefaultOutput(AudioState& state) {
+    AudioOutput(AudioState& state, const std::string& device_uid) {
         AudioComponentDescription description{};
         description.componentType = kAudioUnitType_Output;
-        description.componentSubType = kAudioUnitSubType_DefaultOutput;
+        description.componentSubType = device_uid.empty()
+            ? kAudioUnitSubType_DefaultOutput
+            : kAudioUnitSubType_HALOutput;
         description.componentManufacturer = kAudioUnitManufacturer_Apple;
         const auto component = AudioComponentFindNext(nullptr, &description);
-        if (!component) throw std::runtime_error("default output not found");
+        if (!component) throw std::runtime_error("Core Audio output not found");
         check_status(AudioComponentInstanceNew(component, &unit_), "create output");
+        if (!device_uid.empty()) {
+            UInt32 enabled = 1;
+            check_status(AudioUnitSetProperty(
+                unit_, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0,
+                &enabled, sizeof(enabled)), "enable device output");
+            UInt32 disabled = 0;
+            check_status(AudioUnitSetProperty(
+                unit_, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1,
+                &disabled, sizeof(disabled)), "disable device input");
+            const auto device = audio_device_for_uid(device_uid);
+            check_status(AudioUnitSetProperty(
+                unit_, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                &device, sizeof(device)), "select audio output");
+        }
         AudioStreamBasicDescription format{};
         format.mSampleRate = multipoint::protocol::kSampleRate;
         format.mFormatID = kAudioFormatLinearPCM;
@@ -206,7 +249,7 @@ public:
         check_status(AudioUnitInitialize(unit_), "initialize output");
         check_status(AudioOutputUnitStart(unit_), "start output");
     }
-    ~DefaultOutput() {
+    ~AudioOutput() {
         if (!unit_) return;
         AudioOutputUnitStop(unit_);
         AudioUnitUninitialize(unit_);
@@ -234,7 +277,7 @@ struct MacReceiverRuntime::Impl {
               multipoint::protocol::kFramesPerPacket,
               static_cast<std::size_t>(multipoint::protocol::kSampleRate) *
                   config.latency_ms / 1'000)),
-          output(audio) {
+          output(audio, config.output_device_uid) {
         if (config.device_id.empty() || config.device_name.empty()) {
             throw std::invalid_argument("receiver identity is empty");
         }
@@ -296,7 +339,7 @@ struct MacReceiverRuntime::Impl {
             !fields.contains("reply_port") || !fields.contains("session") ||
             fields.at("session") != "3") return;
         const int parsed_port = std::stoi(fields.at("reply_port"));
-        if (parsed_port < 1 || parsed_port > 65'535) return;
+        if (parsed_port < 0 || parsed_port > 65'535) return;
         const auto reply_port = static_cast<std::uint16_t>(parsed_port);
         multipoint::protocol::CryptoKey sender_key{};
         multipoint::protocol::CryptoNonce new_client_nonce{};
@@ -393,7 +436,7 @@ struct MacReceiverRuntime::Impl {
                 if (control.valid && control.message.type ==
                     multipoint::protocol::SessionMessageType::ping) {
                     last_activity_ns.store(now_ns(), std::memory_order_relaxed);
-                    if (!outbound || active_reply_port == 0) continue;
+                    if (!outbound) continue;
                     const auto pong = multipoint::protocol::serialize_session({
                         .type = multipoint::protocol::SessionMessageType::pong,
                         .fields = {
@@ -493,7 +536,7 @@ struct MacReceiverRuntime::Impl {
     multipoint::transport::ReceiverEngine transport;
     const std::size_t target_frames;
     AudioState audio;
-    DefaultOutput output;
+    AudioOutput output;
     NSNetService* service = nil;
     std::atomic<bool> running{false};
     std::thread network_thread;

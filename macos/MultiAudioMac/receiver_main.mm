@@ -307,7 +307,7 @@ int main(int argc, char** argv) {
                         if (session.message.type ==
                             multipoint::protocol::SessionMessageType::hello) {
                             const auto& fields = session.message.fields;
-                            if (reply_port == 0 || !fields.contains("device_id") ||
+                            if (!fields.contains("device_id") ||
                                 !fields.contains("name") ||
                                 !fields.contains("public_key") ||
                                 !fields.contains("client_nonce") ||
@@ -428,7 +428,7 @@ int main(int argc, char** argv) {
                         opened.plaintext);
                     if (secure_session.valid && secure_session.message.type ==
                         multipoint::protocol::SessionMessageType::ping) {
-                        if (!outbound_cipher || active_reply_port == 0) continue;
+                        if (!outbound_cipher) continue;
                         const auto pong = multipoint::protocol::serialize_session({
                             .type = multipoint::protocol::SessionMessageType::pong,
                             .fields = {
